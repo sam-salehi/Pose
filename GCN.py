@@ -447,6 +447,21 @@ def joint_to_bone(x: torch.Tensor, bone_pairs: list = COCO_BONE_PAIRS) -> torch.
     return bones
 
 
+def joint_to_motion(x: torch.Tensor) -> torch.Tensor:
+    """
+    First-order temporal motion (velocity) per joint.
+
+    Args:
+        x: [N, M, T, V, C]
+
+    Returns:
+        Same shape; frame t>0 is x[t]-x[t-1], frame 0 is zero.
+    """
+    motion = torch.zeros_like(x)
+    motion[:, :, 1:] = x[:, :, 1:] - x[:, :, :-1]
+    return motion
+
+
 # Canonical class ordering for the classifier.
 PUNCH_CLASSES = [
     "cross",
@@ -466,10 +481,11 @@ NUM_CLASSES = len(PUNCH_CLASSES)
 
 class GCNDetector(nn.Module):
     """
-    Dual-stream ST-GCN punch detector.
+    Multi-stream ST-GCN punch detector: joints, bones (spatial deltas), and
+    temporal motion (frame-to-frame joint velocity).
 
-    Same architecture and I/O as the previous PYSKL-backed version, but with
-    the from-scratch STGCN backbone defined above.
+    Same architecture and I/O shape contract as before; fusion width is
+    ``3 * backbone_out`` (joint + bone + motion).
 
     Args:
         in_channels: 2 for (x, y), 3 for (x, y, confidence).
@@ -503,13 +519,17 @@ class GCNDetector(nn.Module):
             num_joints=num_joints,
             **backbone_kwargs,
         )
+        self.motion_stream = STGCN(
+            in_channels=in_channels,
+            num_joints=num_joints,
+            **backbone_kwargs,
+        )
 
-        # Backbone out_channels is set by the constructor; both streams share
-        # the same config, so they have the same output channel count.
+        # Backbone out_channels is set by the constructor; streams share config.
         backbone_out = self.joint_stream.out_channels
 
         self.head = nn.Sequential(
-            nn.Linear(backbone_out * 2, feature_dim),
+            nn.Linear(backbone_out * 3, feature_dim),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
             nn.Linear(feature_dim, 1),
@@ -532,9 +552,11 @@ class GCNDetector(nn.Module):
         """
         x = _normalize_skeleton_input(x)
         bones = joint_to_bone(x, self.bone_pairs)
+        motion = joint_to_motion(x)
         j = self._pool(self.joint_stream(x))
         b = self._pool(self.bone_stream(bones))
-        fused = torch.cat([j, b], dim=-1)
+        m = self._pool(self.motion_stream(motion))
+        fused = torch.cat([j, b, m], dim=-1)
         logit = self.head(fused).squeeze(-1)
         return torch.sigmoid(logit)
 

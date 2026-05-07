@@ -1,5 +1,101 @@
+# Ignore everything by default; whitelist only source / text project files below.
+# (Requires un-ignored dirs so Git can apply nested rules — see gitignore(5).)
+**
+!**/
+
+# --- Python ---
+!**/*.py
+!**/*.pyi
+
+# --- Notebooks (often code + outputs; strip outputs before commit if needed) ---
+!**/*.ipynb
+
+# --- Docs & prose ---
+!**/*.md
+!**/*.rst
+
+# --- Declarative config / deps lists ---
+!**/*.toml
+!**/*.yaml
+!**/*.yml
+!**/*.txt
+!**/*.ini
+!**/*.cfg
+
+# --- Shell ---
+!**/*.sh
+
+# --- Root-only tooling files ---
+!.gitignore
+!.gitattributes
+!.editorconfig
+
+# --- Extensionless files sometimes tracked ---
+!**/Makefile
+!**/Makefile.*
+!**/Dockerfile
+!**/Dockerfile.*
+!**/LICENSE
+!**/LICENSE.*
+
+# Uncomment if you add native code:
+# !**/*.c
+# !**/*.h
+# !**/*.cpp
+# !**/*.rs
+
+# ------------------------------------------------------------------------------
+# Override: keep data / checkpoints / caches out of the repo (even under !**/).
+# ------------------------------------------------------------------------------
 .cache/
 .claude/
 checkpoints/
 Dataset/
 figures/
+__pycache__/
+*.egg-info/
+
+# Binaries, media, datasets, exports
+*.pdf
+*.npz
+*.npy
+*.pt
+*.pth
+*.pth.tar
+*.onnx
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.task
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.svg
+*.ico
+*.bmp
+*.woff
+*.woff2
+*.ttf
+*.eot
+*.otf
+*.csv
+*.tsv
+*.parquet
+*.feather
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.joblib
+*.sqlite
+*.db
+*.bin
