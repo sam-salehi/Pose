@@ -1,577 +1,543 @@
 """
-Train a punch-type classifier on the BoxingVI pose dataset.
+train.py — GCNDetector and GCNClassifier training for BoxingVI.
 
-Paradigms:
-  gru (default): windowed skeleton → hip-centred normalisation → embedding + deep BiGRU + attention pool + MLP head
-  fae: pixel-space windows → FAE (192-D, math.md) → StandardScaler → KNN K=4 distance-weighted
+Input shape to both models: [N, M=1, T, V=12, C=2]  (xy normalised coords)
+  Detector:   T=11 sliding windows, binary punch/no-punch, BCELoss
+  Classifier: T=20 centred clips,   6 punch types, CrossEntropyLoss
+
+Train/Val/Test split is video-level (V1-V7 / V8-V9 / V10) to prevent leakage.
 
 Usage:
-    python train.py                              # GRU, stratified 80/20
-    python train.py --split lovo                 # leave-one-video-out
-    python train.py --paradigm fae --split cv10  # FAE+KNN, 10-fold stratified CV
-    python train.py --paradigm fae --save-fae checkpoints/fae_knn.joblib
+    # Detector — extract full-video poses on first run (cached afterwards):
+    python train.py detector [--epochs 50] [--batch 64] [--lr 1e-3]
+
+    # Classifier:
+    python train.py classifier [--epochs 100] [--batch 32] [--lr 1e-3]
 """
 
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
-import joblib
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+import cv2
+import mediapipe as mp
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
-from sklearn.model_selection import StratifiedShuffleSplit, StratifiedKFold
-from sklearn.metrics import ConfusionMatrixDisplay, classification_report, confusion_matrix
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
+from sklearn.metrics import classification_report, f1_score, precision_recall_fscore_support
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
-from preprocess import prepare_windows
-from fae import encode_fae
+from GCN import GCNClassifier, GCNDetector, PUNCH_CLASSES
+from preprocess import (
+    _LANDMARK_IDX,
+    _MODEL_PATH,
+    _ensure_model,
+    _find_video,
+    prepare_windows,
+)
 
-# ── Constants ─────────────────────────────────────────────────────────────────
+# ── Paths ────────────────────────────────────────────────────────────────────
 
-_REPO     = Path(__file__).resolve().parent
-_DATA_NPZ = _REPO / "Dataset" / "landmarks.npz"
+_REPO          = Path(__file__).resolve().parent
+_POSE_SEQ_DIR  = _REPO / "Dataset" / "pose_sequences"
+_DET_LABEL_DIR = _REPO / "Dataset" / "detection_frame_labels"
+_LANDMARKS_NPZ = _REPO / "Dataset" / "landmarks.npz"
+_CKPT_DIR      = _REPO / "checkpoints"
 
-# Canonical class order for BoxingVI (6 classes)
-CLASSES = ["Jab", "Cross", "Lead Hook", "Rear Hook", "Lead Uppercut", "Rear Uppercut"]
-CLASS_TO_IDX: dict[str, int] = {c: i for i, c in enumerate(CLASSES)}
+# ── 12-joint topology (matches MEDIAPIPE_TO_PAPER order) ─────────────────────
+# 0=l_shoulder  1=r_shoulder  2=l_elbow  3=r_elbow  4=l_wrist  5=r_wrist
+# 6=l_hip       7=r_hip       8=l_knee   9=r_knee  10=l_ankle 11=r_ankle
 
-_FIGURES_DIR = _REPO / "figures"
+BONE_PAIRS_12 = [
+    (0, 2), (2, 4),   # left arm
+    (1, 3), (3, 5),   # right arm
+    (0, 1),           # shoulders
+    (0, 6), (1, 7),   # torso sides
+    (6, 7),           # hips
+    (6, 8), (8, 10),  # left leg
+    (7, 9), (9, 11),  # right leg
+]
+CENTER_12 = 6  # left_hip
+
+BACKBONE_12 = dict(
+    edges=BONE_PAIRS_12,
+    center=CENTER_12,
+    num_joints=12,
+    base_channels=32,
+    inflate_stages=[4, 7],
+    down_stages=[4, 7],
+)
+
+# ── Video split ───────────────────────────────────────────────────────────────
+
+TRAIN_VERS = [f"V{i}" for i in range(1, 8)]   # V1–V7
+VAL_VERS   = ["V8", "V9"]
+TEST_VERS  = ["V10"]
+
+# ── Label vocabulary ─────────────────────────────────────────────────────────
+
+# Map annotation labels → PUNCH_CLASSES index (case-insensitive, space→underscore)
+_LABEL_MAP = {lbl.lower().replace(" ", "_"): i for i, lbl in enumerate(PUNCH_CLASSES)}
+
+def _label_to_idx(raw: str) -> int:
+    return _LABEL_MAP[raw.strip().lower().replace(" ", "_")]
 
 
-def _save_confusion_matrix_figure(
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    *,
-    out_path: Path,
-    title: str,
-) -> None:
-    """Save a confusion matrix image with class names on both axes."""
-    labels_idx = np.arange(len(CLASSES))
-    cm = confusion_matrix(y_true, y_pred, labels=labels_idx)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=CLASSES)
-    fig, ax = plt.subplots(figsize=(10, 8))
-    disp.plot(ax=ax, cmap="Blues", values_format="d", colorbar=True)
-    ax.set_title(title)
-    plt.setp(ax.get_xticklabels(), rotation=45, ha="right", fontsize=9)
-    plt.setp(ax.get_yticklabels(), fontsize=9)
-    ax.set_xlabel("Predicted label")
-    ax.set_ylabel("True label")
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
+# ══════════════════════════════════════════════════════════════════════════════
+# Full-video pose extraction (for detector dataset)
+# ══════════════════════════════════════════════════════════════════════════════
 
-
-# Joint indices inside our 12-joint array (matches MEDIAPIPE_TO_PAPER order)
-_J_LEFT_SHOULDER  = 0
-_J_RIGHT_SHOULDER = 1
-_J_LEFT_HIP       = 6
-_J_RIGHT_HIP      = 7
-
-# ── Data loading ───────────────────────────────────────────────────────────────
-
-def load_dataset(
-    npz_path: Path = _DATA_NPZ,
-    *,
-    normalize: bool = True,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def extract_full_video_poses(versions: list[str] | None = None) -> None:
     """
-    Load landmarks.npz and apply windowing; optionally skeleton normalisation.
+    Run MediaPipe on every frame of each video; save (F, 12, 2) arrays.
 
-    Returns:
-        X        : (N, 20, 12, 2) float32 — GRU: normalised; FAE: raw pixel-space windows
-        y        : (N,) int64            — class indices 0-5
-        versions : (N,) str array        — source video ('V1'…'V10')
+    Skips versions whose cache file already exists.
+    Output: Dataset/pose_sequences/V{i}_pose.npz  with key 'pose' shape (F, 12, 2).
     """
-    if not npz_path.exists():
-        raise FileNotFoundError(
-            f"{npz_path} not found.\n"
-            "Run  python preprocess.py extract  first to generate it."
-        )
+    _POSE_SEQ_DIR.mkdir(parents=True, exist_ok=True)
+    _ensure_model()
 
-    data     = np.load(npz_path, allow_pickle=True)
-    seqs     = data["sequences"]    # object array of (T_i, 12, 2)
-    labels   = data["labels"]       # string array
-    versions = data["versions"]     # 'V1'…'V10'
+    if versions is None:
+        versions = [f"V{i}" for i in range(1, 11)]
 
-    # ── windowing ─────────────────────────────────────────────────────────────
-    X_raw, y_str = prepare_windows(seqs, labels)   # (N, 20, 12, 2), (N,)
-    X_raw = np.nan_to_num(X_raw.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    options = mp_vision.PoseLandmarkerOptions(
+        base_options=mp_python.BaseOptions(model_asset_path=str(_MODEL_PATH)),
+        running_mode=mp_vision.RunningMode.IMAGE,
+        num_poses=1,
+        min_pose_detection_confidence=0.4,
+        min_pose_presence_confidence=0.4,
+        min_tracking_confidence=0.4,
+    )
 
-    # ── skeleton normalisation (FAE uses raw windows; math.md centres internally) ──
-    if normalize:
-        X = _normalise_skeleton(X_raw)
-    else:
-        X = X_raw.astype(np.float32)
+    with mp_vision.PoseLandmarker.create_from_options(options) as landmarker:
+        for ver in versions:
+            out = _POSE_SEQ_DIR / f"{ver}_pose.npz"
+            if out.exists():
+                print(f"[{ver}] pose cache exists — skip")
+                continue
 
-    # ── label encoding ────────────────────────────────────────────────────────
-    y = _encode_labels(y_str)
+            vid = _find_video(ver)
+            if vid is None:
+                print(f"[{ver}] no video found — skip", file=sys.stderr)
+                continue
 
-    return X, y, versions
+            cap = cv2.VideoCapture(str(vid))
+            F = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            print(f"[{ver}] extracting poses for {F} frames …")
+
+            pose = np.zeros((F, 12, 2), dtype=np.float32)
+            for f in range(F):
+                ok, bgr = cap.read()
+                if not ok:
+                    break
+                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                result = landmarker.detect(
+                    mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                )
+                if result.pose_landmarks:
+                    lms = result.pose_landmarks[0]
+                    for j, mp_idx in enumerate(_LANDMARK_IDX):
+                        lm = lms[mp_idx]
+                        pose[f, j, 0] = lm.x
+                        pose[f, j, 1] = lm.y
+                if (f + 1) % 1000 == 0:
+                    print(f"  {f + 1}/{F} frames done")
+
+            cap.release()
+            np.savez_compressed(out, pose=pose)
+            print(f"[{ver}] saved → {out.name}  (shape {pose.shape})")
 
 
-def _normalise_skeleton(X: np.ndarray) -> np.ndarray:
+# ══════════════════════════════════════════════════════════════════════════════
+# Datasets
+# ══════════════════════════════════════════════════════════════════════════════
+
+class DetectionDataset(Dataset):
     """
-    Centre each frame on the hip midpoint and scale by torso length.
+    Sliding-window detection dataset.
 
-    X : (N, 20, 12, 2)
-    Returns the same shape, float32.
-
-    Torso length = distance from hip midpoint to shoulder midpoint,
-    averaged over the 20 frames to give a per-clip scale.
-    Clips where all frames are zero (full detection failure) are left as-is.
+    Each item: (x, y) where
+      x : float32 tensor [1, T, 12, 2]  — [M, T, V, C]
+      y : float32 scalar — 1.0 if any punch frame in window, else 0.0
     """
-    X = X.copy()
-    hip_mid      = (X[:, :, _J_LEFT_HIP,  :] + X[:, :, _J_RIGHT_HIP,  :]) / 2  # (N,20,2)
-    shoulder_mid = (X[:, :, _J_LEFT_SHOULDER, :] + X[:, :, _J_RIGHT_SHOULDER, :]) / 2
 
-    torso_per_frame = np.linalg.norm(shoulder_mid - hip_mid, axis=-1, keepdims=True)  # (N,20,1)
-    torso_scale     = torso_per_frame.mean(axis=1, keepdims=True)                     # (N,1,1)
-    torso_scale     = np.where(torso_scale < 1e-6, 1.0, torso_scale)
+    def __init__(self, versions: list[str], window: int = 11):
+        self.window = window
+        self.samples: list[tuple[np.ndarray, float]] = []
 
-    X -= hip_mid[:, :, np.newaxis, :]          # translate
-    X /= torso_scale[:, :, np.newaxis, :]      # scale
-    return X.astype(np.float32)
+        for ver in versions:
+            pose_path  = _POSE_SEQ_DIR / f"{ver}_pose.npz"
+            label_path = _DET_LABEL_DIR / f"{ver}_detection.npz"
+            if not pose_path.exists() or not label_path.exists():
+                print(f"[{ver}] missing pose or label file — skip", file=sys.stderr)
+                continue
+
+            pose   = np.load(pose_path)["pose"]             # (F, 12, 2)
+            labels = np.load(label_path)
+
+            starts    = labels["window_starts"]              # (W,) int64
+            is_punch  = labels["window_is_punch"].astype(np.float32)  # (W,)
+
+            for t, y in zip(starts, is_punch):
+                end = t + window
+                if end > len(pose):
+                    continue
+                clip = pose[t:end]                           # (T, 12, 2)
+                self.samples.append((clip, y))
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int):
+        clip, y = self.samples[idx]
+        x = torch.from_numpy(clip).unsqueeze(0)             # [1, T, 12, 2]
+        return x, torch.tensor(y, dtype=torch.float32)
+
+    def pos_weight(self) -> torch.Tensor:
+        """BCEWithLogitsLoss pos_weight = #neg / #pos."""
+        labels = np.array([s[1] for s in self.samples])
+        n_pos = labels.sum()
+        n_neg = len(labels) - n_pos
+        return torch.tensor([n_neg / max(n_pos, 1)], dtype=torch.float32)
 
 
-def _encode_labels(y_str: np.ndarray) -> np.ndarray:
-    """Map label strings to class indices, raising on unknown labels."""
-    out = np.empty(len(y_str), dtype=np.int64)
-    for i, lbl in enumerate(y_str):
-        if lbl not in CLASS_TO_IDX:
-            raise ValueError(
-                f"Unknown label '{lbl}'.  Known classes: {CLASSES}\n"
-                "Check _normalize_label() in preprocess.py."
-            )
-        out[i] = CLASS_TO_IDX[lbl]
-    return out
+class ClassifierDataset(Dataset):
+    """
+    Per-clip punch-type classification dataset.
 
+    Each item: (x, y) where
+      x : float32 tensor [1, 20, 12, 2]  — [M, T, V, C]
+      y : int64 class index in [0, 5]
+    """
 
-# ── PyTorch Dataset ────────────────────────────────────────────────────────────
+    def __init__(self, versions: list[str], window: int = 20):
+        data = np.load(_LANDMARKS_NPZ, allow_pickle=True)
+        seqs     = data["sequences"]   # object array of (T_i, 12, 2)
+        raw_lbls = data["labels"]      # (N,) str
+        vers_arr = data["versions"]    # (N,) str
 
-class PunchDataset(Dataset):
-    """Wraps (N, 20, 12, 2) arrays for use with DataLoader."""
+        mask = np.isin(vers_arr, versions)
+        seqs     = seqs[mask]
+        raw_lbls = raw_lbls[mask]
 
-    def __init__(self, X: np.ndarray, y: np.ndarray) -> None:
-        # flatten spatial dims: (N, 20, 24)
-        self.X = torch.from_numpy(X.reshape(len(X), 20, -1))
-        self.y = torch.from_numpy(y)
+        X, y_str = prepare_windows(seqs, raw_lbls, window=window)  # (N, 20, 12, 2)
+        y = np.array([_label_to_idx(lbl) for lbl in y_str], dtype=np.int64)
+
+        # replace any residual NaN with 0
+        X = np.nan_to_num(X, nan=0.0)
+
+        self.X = torch.from_numpy(X).unsqueeze(1)   # [N, 1, 20, 12, 2]
+        self.y = torch.from_numpy(y)                # [N]
 
     def __len__(self) -> int:
         return len(self.y)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int):
         return self.X[idx], self.y[idx]
 
-
-# ── Model ──────────────────────────────────────────────────────────────────────
-
-class PunchNet(nn.Module):
-    """
-    Sequence classifier over normalised 20-frame skeletons.
-
-    Stack: per-frame linear embed + LayerNorm + GELU → stacked bidirectional GRU
-    → learned attention pooling over time → two-hidden-layer MLP head.
-
-    Input : (batch, 20, 24) — 12 joints × 2 coords per frame
-    Output: (batch, n_classes) — logits
-    """
-
-    def __init__(
-        self,
-        input_size:  int = 24,
-        hidden_size: int = 160,
-        num_layers:  int = 3,
-        n_classes:   int = len(CLASSES),
-        dropout:     float = 0.35,
-    ) -> None:
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.frame_embed = nn.Sequential(
-            nn.Linear(input_size, hidden_size),
-            nn.LayerNorm(hidden_size),
-            nn.GELU(),
-            nn.Dropout(dropout * 0.5),
-        )
-        self.gru = nn.GRU(
-            hidden_size,
-            hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            bidirectional=True,
-            dropout=dropout if num_layers > 1 else 0.0,
-        )
-        gru_dim = hidden_size * 2
-        self.attention = nn.Sequential(
-            nn.Linear(gru_dim, gru_dim // 2),
-            nn.Tanh(),
-            nn.Linear(gru_dim // 2, 1),
-        )
-        mid = max(64, hidden_size // 2)
-        self.head = nn.Sequential(
-            nn.LayerNorm(gru_dim),
-            nn.Linear(gru_dim, hidden_size),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size, mid),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(mid, n_classes),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, 24)
-        h = self.frame_embed(x)
-        h, _ = self.gru(h)
-        att = torch.softmax(self.attention(h), dim=1)
-        pooled = (h * att).sum(dim=1)
-        return self.head(pooled)
-
-    def config_dict(self) -> dict:
-        return {
-            "input_size": 24,
-            "hidden_size": self.hidden_size,
-            "num_layers": self.num_layers,
-            "n_classes": len(CLASSES),
-        }
+    def class_weights(self) -> torch.Tensor:
+        """Inverse-frequency weights for CrossEntropyLoss."""
+        counts = torch.zeros(len(PUNCH_CLASSES))
+        for lbl in self.y:
+            counts[lbl] += 1
+        weights = 1.0 / counts.clamp(min=1)
+        return weights / weights.sum() * len(PUNCH_CLASSES)
 
 
-# ── Training utilities ─────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Training utilities
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _make_balanced_sampler(dataset: DetectionDataset) -> WeightedRandomSampler:
+    labels = np.array([s[1] for s in dataset.samples])
+    n_pos  = labels.sum()
+    n_neg  = len(labels) - n_pos
+    w_pos  = 1.0 / max(n_pos, 1)
+    w_neg  = 1.0 / max(n_neg, 1)
+    sample_weights = torch.tensor(
+        [w_pos if y == 1 else w_neg for y in labels], dtype=torch.float32
+    )
+    return WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
+
 
 def _train_epoch(
     model: nn.Module,
     loader: DataLoader,
-    optimiser: torch.optim.Optimizer,
+    optimizer: torch.optim.Optimizer,
     criterion: nn.Module,
     device: torch.device,
-) -> tuple[float, float]:
+    is_detector: bool,
+) -> float:
     model.train()
-    total_loss, correct, n = 0.0, 0, 0
-    for X_batch, y_batch in loader:
-        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-        optimiser.zero_grad()
-        logits = model(X_batch)
-        loss   = criterion(logits, y_batch)
+    total_loss = 0.0
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        optimizer.zero_grad()
+        out = model(x)
+        loss = criterion(out, y)
         loss.backward()
-        optimiser.step()
-        total_loss += loss.item() * len(y_batch)
-        correct    += (logits.argmax(1) == y_batch).sum().item()
-        n          += len(y_batch)
-    return total_loss / n, correct / n
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        optimizer.step()
+        total_loss += loss.item() * len(y)
+    return total_loss / len(loader.dataset)
 
 
 @torch.no_grad()
-def _eval_epoch(
+def _evaluate_detector(
     model: nn.Module,
     loader: DataLoader,
     criterion: nn.Module,
     device: torch.device,
-) -> tuple[float, float, np.ndarray, np.ndarray]:
+    threshold: float = 0.5,
+) -> dict:
     model.eval()
-    total_loss, correct, n = 0.0, 0, 0
-    all_preds, all_targets = [], []
-    for X_batch, y_batch in loader:
-        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-        logits = model(X_batch)
-        loss   = criterion(logits, y_batch)
-        preds  = logits.argmax(1)
-        total_loss += loss.item() * len(y_batch)
-        correct    += (preds == y_batch).sum().item()
-        n          += len(y_batch)
-        all_preds.append(preds.cpu().numpy())
-        all_targets.append(y_batch.cpu().numpy())
-    return (
-        total_loss / n, correct / n,
-        np.concatenate(all_preds),
-        np.concatenate(all_targets),
+    total_loss = 0.0
+    all_probs, all_true = [], []
+
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        probs = model(x)
+        total_loss += criterion(probs, y).item() * len(y)
+        all_probs.append(probs.cpu().numpy())
+        all_true.append(y.cpu().numpy())
+
+    probs = np.concatenate(all_probs)
+    true  = np.concatenate(all_true)
+    preds = (probs >= threshold).astype(int)
+
+    p, r, f1, _ = precision_recall_fscore_support(
+        true, preds, average="binary", zero_division=0
     )
+    acc = (preds == true.astype(int)).mean()
+    return {
+        "loss": total_loss / len(loader.dataset),
+        "acc":  acc,
+        "prec": p,
+        "rec":  r,
+        "f1":   f1,
+    }
 
 
-# ── Split helpers ──────────────────────────────────────────────────────────────
+@torch.no_grad()
+def _evaluate_classifier(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+) -> dict:
+    model.eval()
+    total_loss = 0.0
+    all_preds, all_true = [], []
 
-def _random_split(
-    X: np.ndarray, y: np.ndarray, versions: np.ndarray, test_size: float, seed: int
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    sss = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
-    train_idx, val_idx = next(sss.split(X, y))
-    return X[train_idx], X[val_idx], y[train_idx], y[val_idx]
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        logits = model(x)
+        total_loss += criterion(logits, y).item() * len(y)
+        all_preds.append(logits.argmax(dim=-1).cpu().numpy())
+        all_true.append(y.cpu().numpy())
+
+    preds = np.concatenate(all_preds)
+    true  = np.concatenate(all_true)
+    acc   = (preds == true).mean()
+    f1    = f1_score(true, preds, average="macro", zero_division=0)
+    return {
+        "loss": total_loss / len(loader.dataset),
+        "acc":  acc,
+        "f1":   f1,
+    }
 
 
-def _lovo_splits(
-    X: np.ndarray, y: np.ndarray, versions: np.ndarray
-) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, str]]:
-    """Yield (X_train, X_val, y_train, y_val, held_out_version) for each video."""
-    splits = []
-    for ver in sorted(set(versions)):
-        mask    = versions == ver
-        splits.append((X[~mask], X[mask], y[~mask], y[mask], ver))
-    return splits
+# ══════════════════════════════════════════════════════════════════════════════
+# Top-level training routines
+# ══════════════════════════════════════════════════════════════════════════════
 
+def train_detector(args: argparse.Namespace) -> None:
+    device = torch.device(args.device)
+    _CKPT_DIR.mkdir(parents=True, exist_ok=True)
 
-def _make_fae_pipeline() -> Pipeline:
-    """Standardise features then KNN K=4 with distance weighting (math.md Steps 11–12)."""
-    return Pipeline(
-        [
-            ("scaler", StandardScaler()),
-            (
-                "knn",
-                KNeighborsClassifier(
-                    n_neighbors=4,
-                    weights="distance",
-                    metric="euclidean",
-                ),
-            ),
+    all_vers = TRAIN_VERS + VAL_VERS + TEST_VERS
+    if args.extract_poses:
+        extract_full_video_poses(all_vers)
+    else:
+        missing = [
+            v for v in all_vers
+            if not (_POSE_SEQ_DIR / f"{v}_pose.npz").exists()
         ]
+        if missing:
+            print(
+                f"Pose cache missing for {missing}.\n"
+                "Re-run with --extract-poses to generate it.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    print("\nBuilding datasets …")
+    train_ds = DetectionDataset(TRAIN_VERS)
+    val_ds   = DetectionDataset(VAL_VERS)
+    test_ds  = DetectionDataset(TEST_VERS)
+    print(f"  train={len(train_ds)}  val={len(val_ds)}  test={len(test_ds)}")
+
+    sampler    = _make_balanced_sampler(train_ds)
+    train_loader = DataLoader(train_ds, batch_size=args.batch, sampler=sampler,
+                              num_workers=4, pin_memory=True)
+    val_loader   = DataLoader(val_ds,   batch_size=args.batch * 2, shuffle=False,
+                              num_workers=4, pin_memory=True)
+    test_loader  = DataLoader(test_ds,  batch_size=args.batch * 2, shuffle=False,
+                              num_workers=4, pin_memory=True)
+
+    model = GCNDetector(
+        in_channels=2,
+        num_joints=12,
+        feature_dim=64,
+        dropout=args.dropout,
+        backbone_kwargs=BACKBONE_12,
+    ).to(device)
+
+    pos_weight = train_ds.pos_weight().to(device)
+    criterion  = nn.BCELoss()                       # model already applies sigmoid
+    optimizer  = torch.optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=args.wd
+    )
+    scheduler  = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs, eta_min=args.lr * 1e-2
+    )
+
+    print(f"\nTraining GCNDetector for {args.epochs} epochs on {device}\n")
+    best_f1, best_epoch = 0.0, 0
+
+    for epoch in range(1, args.epochs + 1):
+        train_loss = _train_epoch(model, train_loader, optimizer, criterion, device, True)
+        val_m      = _evaluate_detector(model, val_loader, criterion, device)
+        scheduler.step()
+
+        print(
+            f"Ep {epoch:3d}/{args.epochs} | "
+            f"train_loss={train_loss:.4f} | "
+            f"val_loss={val_m['loss']:.4f}  acc={val_m['acc']:.3f}  "
+            f"prec={val_m['prec']:.3f}  rec={val_m['rec']:.3f}  f1={val_m['f1']:.3f}"
+        )
+
+        if val_m["f1"] > best_f1:
+            best_f1, best_epoch = val_m["f1"], epoch
+            torch.save(model.state_dict(), _CKPT_DIR / "detector_best.pt")
+
+        if epoch - best_epoch >= args.patience:
+            print(f"Early stopping at epoch {epoch} (best F1={best_f1:.3f} @ ep {best_epoch})")
+            break
+
+    print(f"\nBest val F1: {best_f1:.3f} at epoch {best_epoch}")
+    model.load_state_dict(torch.load(_CKPT_DIR / "detector_best.pt", map_location=device))
+    test_m = _evaluate_detector(model, test_loader, criterion, device)
+    print(
+        f"\n── Test results ──\n"
+        f"  loss={test_m['loss']:.4f}  acc={test_m['acc']:.3f}  "
+        f"prec={test_m['prec']:.3f}  rec={test_m['rec']:.3f}  f1={test_m['f1']:.3f}"
     )
 
 
-def main_fae(args: argparse.Namespace, npz_path: Path) -> None:
-    print("Loading dataset (pixel-space windows for FAE) …")
-    X_win, y, versions = load_dataset(npz_path, normalize=False)
-    X = encode_fae(X_win)
-    print(f"  {len(X)} clips — FAE shape {X.shape[1:]} — classes: {dict(zip(*np.unique(y, return_counts=True)))}")
+def train_classifier(args: argparse.Namespace) -> None:
+    device = torch.device(args.device)
+    _CKPT_DIR.mkdir(parents=True, exist_ok=True)
 
-    if args.split == "cv10":
-        skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=args.seed)
-        fold_accs: list[float] = []
-        all_preds: list[np.ndarray] = []
-        all_targets: list[np.ndarray] = []
+    print("Building datasets …")
+    train_ds = ClassifierDataset(TRAIN_VERS)
+    val_ds   = ClassifierDataset(VAL_VERS)
+    test_ds  = ClassifierDataset(TEST_VERS)
+    print(f"  train={len(train_ds)}  val={len(val_ds)}  test={len(test_ds)}")
 
-        for fold_idx, (train_idx, test_idx) in enumerate(skf.split(X, y), 1):
-            clf = _make_fae_pipeline()
-            clf.fit(X[train_idx], y[train_idx])
-            pred = clf.predict(X[test_idx])
-            acc = float((pred == y[test_idx]).mean())
-            fold_accs.append(acc)
-            all_preds.append(pred)
-            all_targets.append(y[test_idx])
-            print(f"  Fold {fold_idx}/10  accuracy = {acc:.4f}")
+    train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True,
+                              num_workers=4, pin_memory=True)
+    val_loader   = DataLoader(val_ds,   batch_size=args.batch * 2, shuffle=False,
+                              num_workers=4, pin_memory=True)
+    test_loader  = DataLoader(test_ds,  batch_size=args.batch * 2, shuffle=False,
+                              num_workers=4, pin_memory=True)
 
-        mu = float(np.mean(fold_accs))
-        sigma = float(np.std(fold_accs, ddof=0))
-        print(f"\n10-fold stratified CV accuracy: μ = {mu:.4f}  σ = {sigma:.4f}  ({mu:.4f} ± {sigma:.4f})")
+    class_w = train_ds.class_weights().to(device)
+    model   = GCNClassifier(
+        num_classes=len(PUNCH_CLASSES),
+        in_channels=2,
+        num_joints=12,
+        feature_dim=128,
+        dropout=args.dropout,
+        backbone_kwargs=BACKBONE_12,
+    ).to(device)
 
-        all_preds_arr = np.concatenate(all_preds)
-        all_targets_arr = np.concatenate(all_targets)
-        print("\n" + "═" * 60)
-        print("Classification report (out-of-fold predictions):")
-        print(classification_report(all_targets_arr, all_preds_arr, target_names=CLASSES))
-        print("Confusion matrix:")
-        print(confusion_matrix(all_targets_arr, all_preds_arr))
-        cm_path = _FIGURES_DIR / "confusion_fae_cv10.png"
-        _save_confusion_matrix_figure(
-            all_targets_arr,
-            all_preds_arr,
-            out_path=cm_path,
-            title="FAE + KNN — 10-fold stratified CV (pooled out-of-fold predictions)",
-        )
-        print(f"Confusion matrix figure → {cm_path}")
-
-    else:
-        if args.split == "lovo":
-            folds = _lovo_splits(X, y, versions)
-        else:
-            X_tr, X_va, y_tr, y_va = _random_split(X, y, versions, args.val_size, args.seed)
-            folds = [(X_tr, X_va, y_tr, y_va, "random")]
-
-        all_preds, all_targets = [], []
-
-        for fold_idx, (X_tr, X_va, y_tr, y_va, fold_name) in enumerate(folds, 1):
-            print(f"\n── Fold {fold_idx}/{len(folds)} (held-out: {fold_name}) ──")
-            clf = _make_fae_pipeline()
-            clf.fit(X_tr, y_tr)
-            pred = clf.predict(X_va)
-            acc = float((pred == y_va).mean())
-            print(f"   train: {len(y_tr)}   val: {len(y_va)}   accuracy: {acc:.4f}")
-            all_preds.append(pred)
-            all_targets.append(y_va)
-
-            ckpt_dir = _REPO / "checkpoints"
-            ckpt_dir.mkdir(exist_ok=True)
-            out_path = ckpt_dir / f"punch_fae_knn_{fold_name}.joblib"
-            joblib.dump({"pipeline": clf, "classes": CLASSES}, out_path)
-            print(f"  Checkpoint → {out_path}")
-
-        all_preds_arr = np.concatenate(all_preds)
-        all_targets_arr = np.concatenate(all_targets)
-        print("\n" + "═" * 60)
-        print("Classification report:")
-        print(classification_report(all_targets_arr, all_preds_arr, target_names=CLASSES))
-        print("Confusion matrix:")
-        print(confusion_matrix(all_targets_arr, all_preds_arr))
-        cm_path = _FIGURES_DIR / f"confusion_fae_{args.split}.png"
-        _save_confusion_matrix_figure(
-            all_targets_arr,
-            all_preds_arr,
-            out_path=cm_path,
-            title=f"FAE + KNN — split={args.split}",
-        )
-        print(f"Confusion matrix figure → {cm_path}")
-
-    if args.save_fae:
-        clf_full = _make_fae_pipeline()
-        clf_full.fit(X, y)
-        out = Path(args.save_fae)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        joblib.dump({"pipeline": clf_full, "classes": CLASSES}, out)
-        print(f"\nFinal FAE+KNN model (trained on all {len(X)} clips) → {out}")
-
-
-def main_gru(args: argparse.Namespace, npz_path: Path) -> None:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
-
-    print("Loading dataset …")
-    X, y, versions = load_dataset(npz_path)
-    print(f"  {len(X)} clips — classes: {dict(zip(*np.unique(y, return_counts=True)))}")
-
-    if args.split == "lovo":
-        folds = _lovo_splits(X, y, versions)
-    else:
-        X_tr, X_va, y_tr, y_va = _random_split(X, y, versions, args.val_size, args.seed)
-        folds = [(X_tr, X_va, y_tr, y_va, "random")]
-
-    all_preds, all_targets = [], []
-
-    for fold_idx, (X_tr, X_va, y_tr, y_va, fold_name) in enumerate(folds, 1):
-        print(f"\n── Fold {fold_idx}/{len(folds)} (held-out: {fold_name}) ──")
-        print(f"   train: {len(y_tr)}   val: {len(y_va)}")
-
-        train_ds = PunchDataset(X_tr, y_tr)
-        val_ds   = PunchDataset(X_va, y_va)
-        train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,  num_workers=2)
-        val_dl   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, num_workers=2)
-
-        model = PunchNet(
-            hidden_size=args.hidden,
-            num_layers=args.gru_layers,
-            dropout=args.dropout,
-        ).to(device)
-        n_params = sum(p.numel() for p in model.parameters())
-        print(f"   PunchNet  ~{n_params / 1e6:.2f}M params  hidden={args.hidden}  BiGRU layers={args.gru_layers}")
-        optimiser = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimiser, T_max=args.epochs)
-        criterion = nn.CrossEntropyLoss()
-
-        best_val_acc = 0.0
-        best_state   = None
-
-        for epoch in range(1, args.epochs + 1):
-            tr_loss, tr_acc = _train_epoch(model, train_dl, optimiser, criterion, device)
-            va_loss, va_acc, preds, targets = _eval_epoch(model, val_dl, criterion, device)
-            scheduler.step()
-
-            if va_acc > best_val_acc:
-                best_val_acc = va_acc
-                best_state   = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-                best_preds, best_targets = preds, targets
-
-            if epoch % max(1, args.epochs // 10) == 0 or epoch == 1:
-                print(
-                    f"  ep {epoch:3d}/{args.epochs}  "
-                    f"train loss {tr_loss:.4f}  acc {tr_acc:.3f}  |  "
-                    f"val loss {va_loss:.4f}  acc {va_acc:.3f}  "
-                    f"{'*' if va_acc == best_val_acc else ''}"
-                )
-
-        print(f"\n  Best val acc: {best_val_acc:.4f}")
-        all_preds.append(best_preds)
-        all_targets.append(best_targets)
-
-        # Save best checkpoint per fold
-        ckpt_dir = _REPO / "checkpoints"
-        ckpt_dir.mkdir(exist_ok=True)
-        ckpt_path = ckpt_dir / f"punch_gru_{fold_name}.pt"
-        torch.save(
-            {
-                "model_state": best_state,
-                "classes": CLASSES,
-                "architecture": "PunchNet",
-                "model_cfg": {
-                    "hidden_size": args.hidden,
-                    "num_layers": args.gru_layers,
-                    "dropout": args.dropout,
-                },
-            },
-            ckpt_path,
-        )
-        print(f"  Checkpoint → {ckpt_path}")
-
-    # ── Final report ───────────────────────────────────────────────────────────
-    all_preds_arr = np.concatenate(all_preds)
-    all_targets_arr = np.concatenate(all_targets)
-    print("\n" + "═" * 60)
-    print("Classification report (best-epoch predictions per fold):")
-    print(classification_report(all_targets_arr, all_preds_arr, target_names=CLASSES))
-    print("Confusion matrix:")
-    print(confusion_matrix(all_targets_arr, all_preds_arr))
-    cm_path = _FIGURES_DIR / f"confusion_gru_{args.split}.png"
-    _save_confusion_matrix_figure(
-        all_targets_arr,
-        all_preds_arr,
-        out_path=cm_path,
-        title=f"GRU — split={args.split}",
+    criterion = nn.CrossEntropyLoss(weight=class_w)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs, eta_min=args.lr * 1e-2
     )
-    print(f"Confusion matrix figure → {cm_path}")
+
+    print(f"\nTraining GCNClassifier for {args.epochs} epochs on {device}\n")
+    best_f1, best_epoch = 0.0, 0
+
+    for epoch in range(1, args.epochs + 1):
+        train_loss = _train_epoch(model, train_loader, optimizer, criterion, device, False)
+        val_m      = _evaluate_classifier(model, val_loader, criterion, device)
+        scheduler.step()
+
+        print(
+            f"Ep {epoch:3d}/{args.epochs} | "
+            f"train_loss={train_loss:.4f} | "
+            f"val_loss={val_m['loss']:.4f}  acc={val_m['acc']:.3f}  f1={val_m['f1']:.3f}"
+        )
+
+        if val_m["f1"] > best_f1:
+            best_f1, best_epoch = val_m["f1"], epoch
+            torch.save(model.state_dict(), _CKPT_DIR / "classifier_best.pt")
+
+        if epoch - best_epoch >= args.patience:
+            print(f"Early stopping at epoch {epoch} (best F1={best_f1:.3f} @ ep {best_epoch})")
+            break
+
+    print(f"\nBest val macro-F1: {best_f1:.3f} at epoch {best_epoch}")
+    model.load_state_dict(torch.load(_CKPT_DIR / "classifier_best.pt", map_location=device))
+
+    # ── Full test report ──────────────────────────────────────────────────────
+    model.eval()
+    all_preds, all_true = [], []
+    with torch.no_grad():
+        for x, y in test_loader:
+            x = x.to(device)
+            preds = model(x).argmax(dim=-1).cpu().numpy()
+            all_preds.append(preds)
+            all_true.append(y.numpy())
+
+    preds = np.concatenate(all_preds)
+    true  = np.concatenate(all_true)
+    print("\n── Test results ──")
+    print(classification_report(true, preds, target_names=PUNCH_CLASSES, zero_division=0))
 
 
-def main(args: argparse.Namespace) -> None:
-    npz_path = Path(args.data)
-    if args.paradigm == "fae":
-        main_fae(args, npz_path)
-    else:
-        main_gru(args, npz_path)
+# ══════════════════════════════════════════════════════════════════════════════
+# Entry point
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _parse() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Train GCNDetector or GCNClassifier")
+    p.add_argument("mode", choices=["detector", "classifier"])
+    p.add_argument("--extract-poses", action="store_true",
+                   help="(detector only) run MediaPipe on all videos before training")
+    p.add_argument("--epochs",   type=int,   default=60)
+    p.add_argument("--batch",    type=int,   default=64)
+    p.add_argument("--lr",       type=float, default=1e-3)
+    p.add_argument("--wd",       type=float, default=1e-4,  help="weight decay")
+    p.add_argument("--dropout",  type=float, default=0.2)
+    p.add_argument("--patience", type=int,   default=15,    help="early-stop patience (epochs)")
+    p.add_argument(
+        "--device",
+        default="cuda" if torch.cuda.is_available() else "cpu",
+    )
+    return p.parse_args()
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument(
-        "--paradigm",
-        choices=["gru", "fae"],
-        default="gru",
-        help="gru: PunchNet; fae: FAE features + KNN (math.md)",
-    )
-    ap.add_argument("--data", default=str(_DATA_NPZ), help="path to landmarks.npz")
-    ap.add_argument(
-        "--split",
-        choices=["random", "lovo", "cv10"],
-        default="random",
-        help="random: stratified 80/20; lovo: leave-one-video-out; cv10: 10-fold stratified (FAE only)",
-    )
-    ap.add_argument("--val-size", type=float, default=0.2, help="val fraction for random split")
-    ap.add_argument("--epochs", type=int, default=50)
-    ap.add_argument("--batch-size", type=int, default=64)
-    ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--hidden", type=int, default=160, help="GRU hidden size (per direction)")
-    ap.add_argument(
-        "--gru-layers",
-        type=int,
-        default=3,
-        metavar="N",
-        help="number of stacked BiGRU layers",
-    )
-    ap.add_argument("--dropout", type=float, default=0.35)
-    ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument(
-        "--save-fae",
-        default="",
-        help="If set (FAE only), save Pipeline trained on all clips to this path (joblib)",
-    )
-    args = ap.parse_args()
-
-    if args.paradigm == "gru" and args.split == "cv10":
-        raise SystemExit("Use --paradigm fae with --split cv10 (10-fold CV is for the FAE+KNN pipeline).")
-    if args.save_fae and args.paradigm != "fae":
-        raise SystemExit("--save-fae applies only to --paradigm fae.")
-
-    main(args)
+    args = _parse()
+    if args.mode == "detector":
+        train_detector(args)
+    else:
+        train_classifier(args)

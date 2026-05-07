@@ -345,9 +345,37 @@ def build_dataset(
     return seq_arr, np.array(labels)
 
 
+def _interpolate_partial_nans_along_time(seq: np.ndarray) -> np.ndarray:
+    """
+    Linear interpolation along time for each joint coordinate.
+
+    MediaPipe often leaves **partial** frames (some joints NaN). Whole-frame
+    forward-fill does not touch those; zeros after nan_to_num distort the skeleton.
+    """
+    seq = np.asarray(seq, dtype=np.float32).copy()
+    T = seq.shape[0]
+    if T < 2:
+        return seq
+    t = np.arange(T, dtype=np.float64)
+    for j in range(12):
+        for d in range(2):
+            v = seq[:, j, d]
+            if not np.any(np.isnan(v)):
+                continue
+            good = np.isfinite(v)
+            if not np.any(good):
+                continue
+            bad = ~good
+            seq[bad, j, d] = np.interp(t[bad], t[good], v[good]).astype(np.float32)
+    return seq
+
+
 def _sanitize_pose_clip(seq: np.ndarray) -> np.ndarray:
     """
     Copy with forward/backward NaN handling within one clip (matches prepare_windows).
+
+    Whole-frame fill first, then **per-joint temporal interpolation** for brief
+    occlusions (partial NaNs).
 
     seq : (T, 12, 2)
     """
@@ -369,6 +397,7 @@ def _sanitize_pose_clip(seq: np.ndarray) -> np.ndarray:
         else:
             last_good = seq[t]
 
+    seq = _interpolate_partial_nans_along_time(seq)
     return seq
 
 
@@ -587,11 +616,22 @@ if __name__ == "__main__":
     ap.add_argument("--output", default=None, help="output path for extract / validate modes")
     ap.add_argument("--n-clips", type=int, default=30, help="clips to sample in validate mode")
     ap.add_argument("--seed", type=int, default=42, help="random seed for validate mode")
+    ap.add_argument(
+        "--min-confidence",
+        type=float,
+        default=0.5,
+        help="extract / validate: MediaPipe landmark visibility threshold (try 0.35–0.5)",
+    )
     args = ap.parse_args()
 
     if args.mode == "extract":
-        build_dataset(args.output)
+        build_dataset(args.output, min_confidence=args.min_confidence)
     elif args.mode == "validate":
-        validate_landmarks(args.n_clips, seed=args.seed, output_path=args.output)
+        validate_landmarks(
+            args.n_clips,
+            seed=args.seed,
+            output_path=args.output,
+            min_confidence=args.min_confidence,
+        )
     else:
         preview_clips(n_per_version=1, seed=None)
