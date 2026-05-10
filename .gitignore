@@ -51,6 +51,7 @@
 .claude/
 checkpoints/
 Dataset/
+MotionBERT/
 figures/
 __pycache__/
 *.egg-info/

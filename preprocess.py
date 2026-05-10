@@ -401,6 +401,40 @@ def _sanitize_pose_clip(seq: np.ndarray) -> np.ndarray:
     return seq
 
 
+# Hip indices in BoxingVI 12-joint order (MEDIAPIPE_TO_PAPER key order; see GCN.BOXINGVI_BONE_PAIRS).
+BOXINGVI_LEFT_HIP_IDX = 6
+BOXINGVI_RIGHT_HIP_IDX = 7
+
+
+def center_pose_on_hip_midpoint(
+    seq: np.ndarray,
+    *,
+    left_idx: int = BOXINGVI_LEFT_HIP_IDX,
+    right_idx: int = BOXINGVI_RIGHT_HIP_IDX,
+) -> np.ndarray:
+    """
+    Per-frame: subtract hip midpoint from all joints (translational invariance in the image plane).
+
+    ``seq`` is ``(T, 12, 2)`` or ``(T, V, 2)`` with the same joint ordering. If both hips are
+    finite, uses their mean; else the available hip; else no shift for that frame.
+    """
+    x = np.asarray(seq, dtype=np.float32, copy=True)
+    if x.ndim != 3 or x.shape[-1] != 2:
+        raise ValueError(f"expected (T, V, 2), got {x.shape}")
+    lh = x[:, left_idx, :]
+    rh = x[:, right_idx, :]
+    t = x.shape[0]
+    c = np.zeros((t, 2), dtype=np.float32)
+    both = np.isfinite(lh).all(axis=1) & np.isfinite(rh).all(axis=1)
+    c[both] = 0.5 * (lh[both] + rh[both])
+    only_l = (~both) & np.isfinite(lh).all(axis=1)
+    only_r = (~both) & (~only_l) & np.isfinite(rh).all(axis=1)
+    c[only_l] = lh[only_l]
+    c[only_r] = rh[only_r]
+    x -= c[:, np.newaxis, :]
+    return x
+
+
 def prepare_windows(
     sequences: np.ndarray | list,
     labels: np.ndarray | list,

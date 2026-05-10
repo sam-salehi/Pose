@@ -3,7 +3,7 @@ GCN-based punch detector and classifier with a from-scratch ST-GCN backbone.
 
 No dependency on PYSKL — everything is implemented in pure PyTorch.
 
-Architecture: dual-stream (joint + bone) ST-GCN with two downstream heads:
+Architecture: multi-stream ST-GCN (joint + bone + motion) with two downstream heads:
   - GCNDetector: regression head -> punch probability in [0, 1]
   - GCNClassifier: classification head -> logits over 6 punch types
 
@@ -90,6 +90,26 @@ BOXINGVI_BONE_PAIRS: list[tuple[int, int]] = [
 ]
 
 BOXINGVI_CENTER_JOINT = 6
+
+
+# ── H36M-17 (MotionBERT output convention) ─────────────────────────────────
+# Joint indices:
+#   0: pelvis, 1: r_hip, 2: r_knee, 3: r_ankle,
+#   4: l_hip,  5: l_knee, 6: l_ankle,
+#   7: spine,  8: thorax, 9: neck, 10: head,
+#   11: l_shoulder, 12: l_elbow, 13: l_wrist,
+#   14: r_shoulder, 15: r_elbow, 16: r_wrist
+NUM_H36M_JOINTS = 17
+
+H36M_BONE_PAIRS: list[tuple[int, int]] = [
+    (0, 1), (1, 2), (2, 3),         # right leg
+    (0, 4), (4, 5), (5, 6),         # left leg
+    (0, 7), (7, 8), (8, 9), (9, 10),  # spine → head
+    (8, 11), (11, 12), (12, 13),    # left arm
+    (8, 14), (14, 15), (15, 16),    # right arm
+]
+
+H36M_CENTER_JOINT = 0  # pelvis
 
 
 # =============================================================================
@@ -568,7 +588,8 @@ class GCNDetector(nn.Module):
 
 class GCNClassifier(nn.Module):
     """
-    Dual-stream ST-GCN punch type classifier.
+    Multi-stream ST-GCN punch type classifier: joints, bones, and temporal motion
+    (frame-to-frame velocity), same fusion pattern as :class:`GCNDetector`.
 
     Args:
         num_classes: number of output classes. Default 6 (BoxingVI taxonomy).
@@ -604,12 +625,17 @@ class GCNClassifier(nn.Module):
             num_joints=num_joints,
             **backbone_kwargs,
         )
+        self.motion_stream = STGCN(
+            in_channels=in_channels,
+            num_joints=num_joints,
+            **backbone_kwargs,
+        )
 
         backbone_out = self.joint_stream.out_channels
 
         # Wider head than the detector — more capacity for the harder 6-way task.
         self.head = nn.Sequential(
-            nn.Linear(backbone_out * 2, feature_dim),
+            nn.Linear(backbone_out * 3, feature_dim),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
             nn.Linear(feature_dim, feature_dim // 2),
@@ -634,9 +660,11 @@ class GCNClassifier(nn.Module):
         """
         x = _normalize_skeleton_input(x)
         bones = joint_to_bone(x, self.bone_pairs)
+        motion = joint_to_motion(x)
         j = self._pool(self.joint_stream(x))
         b = self._pool(self.bone_stream(bones))
-        fused = torch.cat([j, b], dim=-1)
+        m = self._pool(self.motion_stream(motion))
+        fused = torch.cat([j, b, m], dim=-1)
         return self.head(fused)
 
     @torch.no_grad()

@@ -163,6 +163,30 @@ def build_detector_windows_npz(
     return out_npz
 
 
+def load_pose_sequence_npz(
+    path: Path | str,
+    *,
+    max_frames: int | None = None,
+) -> np.ndarray:
+    """
+    Load a full-video pose cache written by ``extract_pose.py`` /
+    ``Dataset/pose_sequences/Vx_pose.npz``: key ``pose`` with shape ``(F, 12, 2)``.
+    key ``pose`` with shape ``(F, 12, 2)`` float32.
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    d = np.load(path, allow_pickle=True)
+    if "pose" not in d:
+        raise ValueError(f"{path} missing 'pose' array")
+    pose = np.asarray(d["pose"], dtype=np.float32)
+    if pose.ndim != 3 or pose.shape[-2:] != (12, 2):
+        raise ValueError(f"expected pose (F, 12, 2), got {pose.shape}")
+    if max_frames is not None:
+        pose = pose[: int(max_frames)]
+    return pose
+
+
 class DetectorWindowNpzDataset(Dataset):
     """Loads ``build_detector_windows_npz`` output; yields ``x`` [1,1,T,12,2], ``y`` scalar."""
 
@@ -178,6 +202,7 @@ class DetectorWindowNpzDataset(Dataset):
 
     def __getitem__(self, i: int) -> tuple[torch.Tensor, torch.Tensor]:
         x = np.nan_to_num(self.X[i], nan=0.0, posinf=0.0, neginf=0.0)
+        x = center_pose_on_hip_midpoint(x.astype(np.float32))
         n_frames = int(x.shape[0])
         # Explicit [1, 1, T, 12, 2] so DataLoader batches to [N, 1, T, 12, 2] for ST-GCN.
         t = torch.from_numpy(x).reshape(1, 1, n_frames, 12, 2).contiguous()
