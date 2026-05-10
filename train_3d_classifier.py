@@ -40,7 +40,7 @@ _GAP_REVIEW_JSON = _REPO / "Dataset" / "gap_labels" / "gap_review.json"
 
 CLASSIFIER_CLASSES: list[str] = [*PUNCH_CLASSES, "no_punch"]
 NO_PUNCH_IDX = len(PUNCH_CLASSES)
-CLF_WINDOW = 8
+CLF_WINDOW = 16
 JITTER_RANGE = 2   # ± frames shifted from centre during training
 EPOCHS = 200
 BATCH_SIZE = 64
@@ -49,6 +49,7 @@ LR_MIN = 1e-5
 WARMUP_EPOCHS = 5
 VAL_FRAC = 0.1
 SEED = 42
+GRAD_CLIP_MAX_NORM = 1.0  # global L2 clip after backward (transformer stability)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # H36M-17 joint indices (matches punch_classifier._J)
@@ -374,6 +375,7 @@ model = PunchTransformer(
 ).to(DEVICE)
 
 print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+print(f"Gradient clipping: max_norm={GRAD_CLIP_MAX_NORM}")
 
 opt           = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
 cosine_epochs = max(1, EPOCHS - WARMUP_EPOCHS)
@@ -417,6 +419,7 @@ for epoch in range(1, EPOCHS + 1):
         logits = model(xb)
         loss   = crit(logits, yb)
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_MAX_NORM)
         opt.step()
         run_loss += loss.item() * yb.size(0)
         run_ok   += (logits.argmax(1) == yb).sum().item()
@@ -473,6 +476,7 @@ torch.save(
         "source":        "MotionBERT_3d",
         "preprocessing": "body_frame + torso_scale",
         "negatives":     f"gap_review.json @ {_GAP_REVIEW_JSON.relative_to(_REPO)}",
+        "grad_clip_max_norm": GRAD_CLIP_MAX_NORM,
         "augmentation":  f"jitter±{JITTER_RANGE} + mirror_flip(50%, no label swap)",
         "lr_schedule": {
             "warmup_epochs": WARMUP_EPOCHS,

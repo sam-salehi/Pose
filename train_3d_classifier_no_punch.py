@@ -3,7 +3,9 @@
 # Negatives: contiguous frame ranges between ALL xlsx intervals (any label) —
 #   merged to busy ranges, then gaps are mined as no-punch sequences.
 #
-# No training-time augmentation (centre window only).
+# Augmentations (training only):
+#   - Temporal jitter: random ±JITTER_RANGE frames on window centre
+#   - Mirror flip (50%): negate x + swap L/R joints; labels unchanged (body-frame semantics)
 
 from __future__ import annotations
 
@@ -29,14 +31,16 @@ _REPO = Path.cwd().resolve()
 _MOTIONBERT_DIR = _REPO / "Dataset" / "MotionBERT_3d"
 _ANNOTATION_DIR = _REPO / "Dataset" / "Annotation_files"
 
-CLF_WINDOW = 8
-EPOCHS = 200
+CLF_WINDOW = 16
+JITTER_RANGE = 2  # ± frames shifted from centre during training
+EPOCHS = 100
 BATCH_SIZE = 64
 LR = 1e-3
-LR_MIN = 1e-5
+LR_MIN = 1e-3
 WARMUP_EPOCHS = 5
 VAL_FRAC = 0.1
 SEED = 42
+GRAD_CLIP_MAX_NORM = 1.0  # global L2 clip after backward (transformer stability)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Extra class index = 6
@@ -45,8 +49,6 @@ NO_PUNCH_IDX = len(PUNCH_CLASSES)
 
 # Gaps shorter than this (frames) are skipped — avoids tiny slivers between annotations.
 NO_PUNCH_MIN_GAP_FRAMES = 16
-# Long gaps are centre-cropped to this many frames so negatives match punch-clip scale.
-NO_PUNCH_MAX_CLIP_FRAMES = 120
 
 _J_PELVIS = 0
 _J_THORAX = 8
@@ -61,6 +63,9 @@ _LABEL_TO_IDX: dict[str, int] = {
     "Rear Hook":     PUNCH_CLASSES.index("rear_hook"),
     "Rear Uppercut": PUNCH_CLASSES.index("rear_uppercut"),
 }
+
+# H36M-17: swap L/R when mirroring (pelvis(0) … l_wrist(13) r_shoulder(14)…)
+_FLIP_JOINT_ORDER = [0, 4, 5, 6, 1, 2, 3, 7, 8, 9, 10, 14, 15, 16, 11, 12, 13]
 
 
 def _merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -92,13 +97,28 @@ def _gaps_from_busy(busy: list[tuple[int, int]], n_total: int) -> list[tuple[int
     return gaps
 
 
-def _crop_gap_slice(g0: int, g1: int) -> tuple[int, int]:
-    """Centre-crop a long gap to NO_PUNCH_MAX_CLIP_FRAMES."""
-    length = g1 - g0
-    if length <= NO_PUNCH_MAX_CLIP_FRAMES:
-        return g0, g1
-    pad = (length - NO_PUNCH_MAX_CLIP_FRAMES) // 2
-    return g0 + pad, g0 + pad + NO_PUNCH_MAX_CLIP_FRAMES
+def _no_punch_gap_raw_spans(g0: int, g1: int, window: int, stride: int) -> list[tuple[int, int]]:
+    """
+    Half-open gap ``[g0, g1)`` in raw frame indices.
+
+    If shorter than ``window``, one span ``(g0, g1)`` (may pad during windowing).
+    Otherwise sliding windows ``[s, s+window)`` stepping by ``stride``, plus a final
+    window flush to ``g1`` when the stride grid leaves a tail.
+    """
+    L = g1 - g0
+    if L < window:
+        return [(g0, g1)]
+    spans: list[tuple[int, int]] = []
+    s = g0
+    while s + window <= g1:
+        spans.append((s, s + window))
+        s += stride
+    tail_start = g1 - window
+    if not spans:
+        return [(tail_start, g1)]
+    if spans[-1][0] < tail_start:
+        spans.append((tail_start, g1))
+    return spans
 
 
 def _busy_intervals_from_xlsx(annotations: list[tuple[int, int, str]], n_total: int) -> list[tuple[int, int]]:
@@ -144,7 +164,8 @@ def _to_body_frame(poses: np.ndarray) -> np.ndarray:
 
 
 def _scale_normalize(q: np.ndarray) -> np.ndarray:
-    torso = float(np.linalg.norm(q[0, _J_THORAX] - q[0, _J_PELVIS]))
+    torso_lengths = np.linalg.norm(q[:, _J_THORAX] - q[:, _J_PELVIS], axis=-1)
+    torso = float(np.median(torso_lengths))
     return q / torso if torso > 1e-6 else q
 
 
@@ -160,8 +181,13 @@ def _preprocess_clip(clip: np.ndarray) -> np.ndarray:
     )
 
 
-def _prepare_window_3d(seq: np.ndarray, window: int) -> np.ndarray:
-    """Centre-crop ``seq`` to ``window`` frames. Pads short clips by repeating edge frames."""
+def _prepare_window_3d(seq: np.ndarray, window: int, jitter: int = 0) -> np.ndarray:
+    """
+    Centre-crop ``seq`` (T, 17, C) to ``window`` frames.
+
+    ``jitter`` shifts the crop centre (clamped in-bounds). Pads by repeating edge
+    frames when the clip is shorter than ``window``.
+    """
     T = seq.shape[0]
     half = window // 2
 
@@ -175,7 +201,7 @@ def _prepare_window_3d(seq: np.ndarray, window: int) -> np.ndarray:
         ], axis=0)
         T = window
 
-    peak = T // 2
+    peak = T // 2 + jitter
     peak = max(half, min(T - (window - half), peak))
     start = peak - half
     chunk = seq[start: start + window]
@@ -191,6 +217,11 @@ def load_3d_clips_with_negatives() -> tuple[list[np.ndarray], np.ndarray]:
     """
     Punch clips from annotated rows (known punch labels) + no_punch clips from
     inter-annotation gaps in each workbook.
+
+    Long gaps yield multiple negatives: sliding raw-frame windows of length
+    ``CLF_WINDOW`` with stride ``max(1, CLF_WINDOW // 2)``, plus a tail window
+    aligned to the gap end when needed. Short gaps (still ≥ ``NO_PUNCH_MIN_GAP_FRAMES``
+    but ``< CLF_WINDOW``) contribute one clip ``[g0, g1)``.
     """
     clips: list[np.ndarray] = []
     y_list: list[int] = []
@@ -229,19 +260,18 @@ def load_3d_clips_with_negatives() -> tuple[list[np.ndarray], np.ndarray]:
             n_punch += 1
 
         kept_g = 0
+        slide_stride = max(1, CLF_WINDOW // 2)
         for g0, g1 in gaps:
             if g1 - g0 < NO_PUNCH_MIN_GAP_FRAMES:
                 continue
-            a, b = _crop_gap_slice(g0, g1)
-            if b <= a:
-                continue
-            clip = _preprocess_clip(frames[a:b].copy())
-            clips.append(clip)
-            y_list.append(NO_PUNCH_IDX)
-            kept_g += 1
-            n_gap += 1
+            for a, b in _no_punch_gap_raw_spans(g0, g1, CLF_WINDOW, slide_stride):
+                clip = _preprocess_clip(frames[a:b].copy())
+                clips.append(clip)
+                y_list.append(NO_PUNCH_IDX)
+                kept_g += 1
+                n_gap += 1
 
-        print(f"{ver}: punches {kept_p}/{len(annotations)}  no_punch gaps {kept_g}")
+        print(f"{ver}: punches {kept_p}/{len(annotations)}  no_punch windows {kept_g}")
 
     if not clips:
         raise SystemExit("No 3D clips found — check Dataset/MotionBERT_3d/ structure.")
@@ -260,10 +290,12 @@ class Clf3DDataset(Dataset):
         clips: list[np.ndarray],
         y: np.ndarray,
         window: int,
+        augment: bool = False,
     ):
         self.clips = clips
         self.y = y.astype(np.int64)
         self.window = window
+        self.augment = augment
 
     def __len__(self):
         return len(self.y)
@@ -271,7 +303,19 @@ class Clf3DDataset(Dataset):
     def __getitem__(self, i):
         clip = self.clips[i]
         label = int(self.y[i])
-        win = _prepare_window_3d(clip, self.window)
+
+        jitter = (
+            int(np.random.randint(-JITTER_RANGE, JITTER_RANGE + 1))
+            if self.augment
+            else 0
+        )
+        win = _prepare_window_3d(clip, self.window, jitter=jitter)
+
+        if self.augment and np.random.random() < 0.5:
+            win = win[:, _FLIP_JOINT_ORDER, :].copy()
+            win[:, :, 0] *= -1
+            win[:, :, 3] *= -1
+
         return torch.from_numpy(win), torch.tensor(label, dtype=torch.long)
 
 
@@ -311,8 +355,8 @@ idx_train, idx_val = train_test_split(
 train_clips = [all_clips[i] for i in idx_train]
 val_clips = [all_clips[i] for i in idx_val]
 
-train_ds = Clf3DDataset(train_clips, all_y[idx_train], window=CLF_WINDOW)
-val_ds = Clf3DDataset(val_clips, all_y[idx_val], window=CLF_WINDOW)
+train_ds = Clf3DDataset(train_clips, all_y[idx_train], window=CLF_WINDOW, augment=True)
+val_ds = Clf3DDataset(val_clips, all_y[idx_val], window=CLF_WINDOW, augment=False)
 
 train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
 val_dl = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
@@ -343,6 +387,7 @@ model = PunchTransformer(
 ).to(DEVICE)
 
 print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+print(f"Gradient clipping: max_norm={GRAD_CLIP_MAX_NORM}")
 
 opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
 cosine_epochs = max(1, EPOCHS - WARMUP_EPOCHS)
@@ -386,6 +431,7 @@ for epoch in range(1, EPOCHS + 1):
         logits = model(xb)
         loss = crit(logits, yb)
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_MAX_NORM)
         opt.step()
         run_loss += loss.item() * yb.size(0)
         run_ok += (logits.argmax(1) == yb).sum().item()
@@ -441,9 +487,12 @@ torch.save(
         "preprocessing": "body_frame + torso_scale",
         "negatives": (
             f"gaps between xlsx intervals, min_gap={NO_PUNCH_MIN_GAP_FRAMES}, "
-            f"max_clip={NO_PUNCH_MAX_CLIP_FRAMES}"
+            f"sliding raw windows len={CLF_WINDOW} stride={max(1, CLF_WINDOW // 2)}"
         ),
-        "augmentation": "none",
+        "grad_clip_max_norm": GRAD_CLIP_MAX_NORM,
+        "augmentation": (
+            f"jitter±{JITTER_RANGE} + mirror_flip(50%, no label swap)"
+        ),
         "lr_schedule": {
             "warmup_epochs": WARMUP_EPOCHS,
             "warmup": "LinearLR 0.01→1.0 × base LR",

@@ -51,7 +51,7 @@ _WEIGHT_KEYS = tuple(f"w{i}" for i in range(1, 10))
 
 class BoxingPunchClassifier:
     """
-    Boxing punch classifier for MotionBERT H36M-17 3D pose.
+    Rule-based boxing punch classifier for MotionBERT H36M-17 3D pose.
 
     Usage::
 
@@ -59,36 +59,20 @@ class BoxingPunchClassifier:
         label = clf.predict(poses)           # int 1–6
         name  = clf.predict_named(poses)     # e.g. "jab"
 
-    Stage B can be run in two modes:
-      • Rule-based (default): hard thresholds then weighted soft scores (w1–w9).
-      • Learned: pass a sklearn-compatible classifier to ``stage_b_clf``.  When set,
-        hard thresholds and weights are bypassed entirely; the model receives the
-        9-element feature vector from ``_stage_b_features()``.
-
-    Feature vector order (for learned Stage B):
-        0  ρ              straightness ratio
-        1  |Δy|/D         forward displacement
-        2  Δθ_elbow/180   elbow extension change
-        3  Δz/D           vertical displacement   (signed)
-        4  1−ρ            curviness
-        5  |n̂·x̂|         sagittal-plane alignment
-        6  |Δx|/D         lateral displacement
-        7  |n̂·ẑ|         horizontal-plane alignment
-        8  θ_min/180      minimum elbow angle
+    Weight keys w1–w9 control the soft-score fallback in Stage B:
+        w1–w3  straight score:  ρ (straightness), Δy/D (forward), Δθ_elbow/180°
+        w4–w6  uppercut score:  Δz/D (vertical), 1−ρ (curviness), |n̂·x̂| (sagittal)
+        w7–w9  hook score:      |Δx|/D (lateral), 1−ρ (curviness), |n̂·ẑ| (horizontal)
     """
 
-    def __init__(
-        self,
-        weights: dict[str, float] | None = None,
-        stage_b_clf=None,
-    ) -> None:
+    def __init__(self, weights: dict[str, float] | None = None) -> None:
         self.w: dict[str, float] = {k: 1.0 for k in _WEIGHT_KEYS}
         if weights:
             unknown = set(weights) - set(self.w)
             if unknown:
                 raise ValueError(f"Unknown weight keys: {unknown!r}. Valid: {_WEIGHT_KEYS}")
             self.w.update(weights)
-        self._stage_b_clf = stage_b_clf  # sklearn-style clf or None
+            
 
     # ── Public interface ──────────────────────────────────────────────────────
 
@@ -122,8 +106,7 @@ class BoxingPunchClassifier:
     def __repr__(self) -> str:
         non_default = {k: v for k, v in self.w.items() if v != 1.0}
         wstr = f"weights={non_default}" if non_default else ""
-        b2 = f", stage_b_clf={self._stage_b_clf!r}" if self._stage_b_clf is not None else ""
-        return f"BoxingPunchClassifier({wstr}{b2})"
+        return f"BoxingPunchClassifier({wstr})"
 
     # ── Preprocessing ─────────────────────────────────────────────────────────
 
@@ -189,11 +172,8 @@ class BoxingPunchClassifier:
         Active side: whichever wrist shows the larger peak-speed gain above its
         initial speed (filters out the guard hand drifting).
 
-        Lead side: whichever body side is more forward (+y) in the body frame,
-        determined by averaging shoulder and hip y-positions across the full window.
-        Shoulders encode body rotation; hips are stable during punching.  Averaging
-        across all frames makes this robust to windows that begin mid-punch or during
-        casual standing, where a single frame or wrist position would be unreliable.
+        Lead side: the foot that is more forward (+y) in the body frame —
+        orthodox = left lead, southpaw = right lead.
         """
         def _wrist_score(idx: int) -> float:
             speeds = np.linalg.norm(np.diff(q[:, idx], axis=0), axis=1)
@@ -203,55 +183,16 @@ class BoxingPunchClassifier:
         score_r = _wrist_score(_J["r_wrist"])
         active_side = "L" if score_l > score_r else "R"
 
-        # Shoulder + hip average over the full window.
-        # Hips don't move during punching; shoulders rotate but the average across
-        # both joints and all frames suppresses punch-induced bias.
-        l_y = float(q[:, [_J["l_shoulder"], _J["l_hip"]], 1].mean())
-        r_y = float(q[:, [_J["r_shoulder"], _J["r_hip"]], 1].mean())
+        l_y = float(q[0, _J["l_ankle"], 1])
+        r_y = float(q[0, _J["r_ankle"], 1])
         lead_side = "L" if l_y > r_y else "R"
 
         return active_side == lead_side, active_side
 
     # ── Stage B — trajectory family ───────────────────────────────────────────
 
-    def _stage_b_features(self, q: np.ndarray, side: str) -> np.ndarray:
-        """Return the 9-element Stage-B feature vector (see class docstring)."""
-        w_idx = _J["l_wrist"]    if side == "L" else _J["r_wrist"]
-        e_idx = _J["l_elbow"]    if side == "L" else _J["r_elbow"]
-        s_idx = _J["l_shoulder"] if side == "L" else _J["r_shoulder"]
-
-        wrist    = q[:, w_idx, :]
-        elbow    = q[:, e_idx, :]
-        shoulder = q[:, s_idx, :]
-
-        delta = wrist[-1] - wrist[0]
-        D = max(float(np.linalg.norm(delta)), 1e-6)
-        L = max(float(np.sum(np.linalg.norm(np.diff(wrist, axis=0), axis=1))), 1e-6)
-        rho = D / L
-
-        dx, dy, dz = float(delta[0]), float(delta[1]), float(delta[2])
-        theta_min, d_theta = self._elbow_angle_features(shoulder, elbow, wrist)
-        n_hat = self._pca_normal(wrist)
-
-        return np.array([
-            rho,
-            abs(dy) / D,
-            d_theta / 180.0,
-            dz / D,
-            1.0 - rho,
-            abs(float(n_hat @ np.array([1.0, 0.0, 0.0]))),
-            abs(dx) / D,
-            abs(float(n_hat @ np.array([0.0, 0.0, 1.0]))),
-            theta_min / 180.0,
-        ], dtype=np.float64)
-
     def _classify_family(self, q: np.ndarray, side: str) -> str:
         """Returns 'straight', 'hook', or 'uppercut'."""
-        if self._stage_b_clf is not None:
-            feats = self._stage_b_features(q, side)
-            idx = int(self._stage_b_clf.predict(feats[None])[0])
-            return ["straight", "uppercut", "hook"][idx]
-
         w_idx = _J["l_wrist"]    if side == "L" else _J["r_wrist"]
         e_idx = _J["l_elbow"]   if side == "L" else _J["r_elbow"]
         s_idx = _J["l_shoulder"] if side == "L" else _J["r_shoulder"]
@@ -260,19 +201,21 @@ class BoxingPunchClassifier:
         elbow    = q[:, e_idx, :]
         shoulder = q[:, s_idx, :]
 
+        # Displacement and path geometry
         delta = wrist[-1] - wrist[0]
         D = max(float(np.linalg.norm(delta)), 1e-6)
         L = max(float(np.sum(np.linalg.norm(np.diff(wrist, axis=0), axis=1))), 1e-6)
-        rho = D / L
+        rho = D / L  # straightness ratio (1 = perfectly straight)
 
         dx, dy, dz = float(delta[0]), float(delta[1]), float(delta[2])
+
         theta_min, d_theta = self._elbow_angle_features(shoulder, elbow, wrist)
         n_hat = self._pca_normal(wrist)
 
-        x_hat = np.array([1.0, 0.0, 0.0])
-        z_hat = np.array([0.0, 0.0, 1.0])
+        x_hat = np.array([1.0, 0.0, 0.0])  # lateral axis
+        z_hat = np.array([0.0, 0.0, 1.0])  # vertical axis
 
-        # Hard thresholds
+        # Hard thresholds (boxing.md §4 Stage B)
         if rho > 0.85 and abs(dy) / D > 0.7 and d_theta > 70.0:
             return "straight"
         if dz / D > 0.5 and theta_min < 110.0 and abs(float(n_hat @ x_hat)) > 0.7:

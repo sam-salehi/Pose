@@ -6,9 +6,12 @@ classification, overlay predicted class + probability on the RGB MP4.
 
 **Six punch types vs seven (including no punch)**
 
-- Default checkpoint is the **6-class** model from ``train_3d_classifier.py`` — it only
-  outputs punch **types** (jab, cross, …). It never predicts ``no_punch`` because that
-  head does not exist.
+- By default, preview picks the newest ``punch_transformer_*.pt`` that is **not**
+  ``*_gap_review.pt`` or ``*7cls*`` (intended as the 6 punch-type-only head). If you only
+  trained the 7-class pipeline (e.g. ``*_gap_review.pt``), preview falls back to that
+  model automatically.
+- Pass ``--no-punch`` to **prefer** the newest 7-class checkpoint among
+  ``*_gap_review.pt`` and ``punch_transformer_7cls_*.pt``.
 - Use ``--no-punch`` to select a **7-class** checkpoint: newest of
   ``punch_transformer_*_gap_review.pt`` (from ``train_3d_classifier.py`` with
   ``Dataset/gap_labels/gap_review.json`` negatives) or ``punch_transformer_7cls_*.pt``
@@ -75,12 +78,13 @@ def _to_body_frame(poses: np.ndarray) -> np.ndarray:
 
 
 def _scale_normalize(q: np.ndarray) -> np.ndarray:
-    torso = float(np.linalg.norm(q[0, _J_THORAX] - q[0, _J_PELVIS]))
+    torso_lengths = np.linalg.norm(q[:, _J_THORAX] - q[:, _J_PELVIS], axis=-1)
+    torso = float(np.median(torso_lengths))
     return q / torso if torso > 1e-6 else q
 
 
 def _preprocess_full_sequence(poses_xyz: np.ndarray) -> np.ndarray:
-    """``poses_xyz`` (T, 17, 3) raw MotionBERT → (T, 17, 6) like ``train_3d_classifier``."""
+    """``poses_xyz`` (T, 17, 3) raw MotionBERT → (T, 17, 6); scaling matches ``train_3d_classifier_no_punch``."""
     q = _to_body_frame(poses_xyz.astype(np.float64))
     q = _scale_normalize(q)
     q = q.astype(np.float32)
@@ -281,9 +285,17 @@ def main() -> None:
         else:
             d = _default_checkpoint_six_class()
             if d is None:
+                d7 = _default_checkpoint_seven_class()
+                if d7 is not None:
+                    print(
+                        "No 6-class-only checkpoint; using 7-class model:\n  "
+                        f"{d7.relative_to(_REPO)}"
+                    )
+                    d = d7
+            if d is None:
                 raise SystemExit(
-                    "No checkpoints/punch_transformer_*.pt — train with train_3d_classifier.py "
-                    "or pass --checkpoint PATH (use --no-punch for 7-class / no_punch)"
+                    "No checkpoints/punch_transformer_*.pt — train (e.g. train_3d_classifier.py) "
+                    "or pass --checkpoint PATH. Use --no-punch to prefer 7-class / no_punch."
                 )
             ckpt_path = d
     else:
