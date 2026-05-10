@@ -33,10 +33,10 @@ _ANNOTATION_DIR = _REPO / "Dataset" / "Annotation_files"
 
 CLF_WINDOW = 16
 JITTER_RANGE = 2  # ± frames shifted from centre during training
-EPOCHS = 100
+EPOCHS = 200
 BATCH_SIZE = 64
 LR = 1e-3
-LR_MIN = 1e-3
+LR_MIN = 1e-5
 WARMUP_EPOCHS = 5
 VAL_FRAC = 0.1
 SEED = 42
@@ -383,7 +383,7 @@ model = PunchTransformer(
     nhead=4,
     num_layers=4,
     dim_feedforward=256,
-    dropout=0.1,
+    dropout=0.2,
 ).to(DEVICE)
 
 print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -401,14 +401,28 @@ sched = torch.optim.lr_scheduler.SequentialLR(
 )
 
 
+def _tta_mirror_batch(xb: torch.Tensor) -> torch.Tensor:
+    """Mirror skeleton in body frame (same as train aug): swap L/R joints, negate x on pos and vel."""
+    idx = torch.tensor(_FLIP_JOINT_ORDER, device=xb.device, dtype=torch.long)
+    flip = xb[:, :, idx, :].clone()
+    flip[:, :, :, 0] *= -1
+    flip[:, :, :, 3] *= -1
+    return flip
+
+
 @torch.no_grad()
 def eval_epoch(loader):
     model.eval()
     tot, correct, n = 0.0, 0, 0
     all_p, all_t = [], []
+    disagree_n = 0
+    sum_rel = 0.0
     for xb, yb in loader:
         xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-        logits = model(xb)
+        flip = _tta_mirror_batch(xb)
+        lo = model(xb)
+        lf = model(flip)
+        logits = (lo + lf) * 0.5
         loss = crit(logits, yb)
         tot += loss.item() * yb.size(0)
         pred = logits.argmax(dim=1)
@@ -416,7 +430,23 @@ def eval_epoch(loader):
         n += yb.size(0)
         all_p.append(pred.cpu())
         all_t.append(yb.cpu())
-    return tot / max(n, 1), correct / max(n, 1), torch.cat(all_p).numpy(), torch.cat(all_t).numpy()
+        disagree_n += (lo.argmax(dim=1) != lf.argmax(dim=1)).sum().item()
+        diff = lo - lf
+        l2d = diff.flatten(1).norm(dim=1)
+        l2o = lo.flatten(1).norm(dim=1)
+        l2f = lf.flatten(1).norm(dim=1)
+        rel = l2d / (0.5 * (l2o + l2f) + 1e-8)
+        sum_rel += rel.sum().item()
+    disagree_frac = disagree_n / max(n, 1)
+    mean_rel_logit = sum_rel / max(n, 1)
+    return (
+        tot / max(n, 1),
+        correct / max(n, 1),
+        torch.cat(all_p).numpy(),
+        torch.cat(all_t).numpy(),
+        disagree_frac,
+        mean_rel_logit,
+    )
 
 
 best_acc = 0.0
@@ -439,7 +469,7 @@ for epoch in range(1, EPOCHS + 1):
     sched.step()
     lr_now = opt.param_groups[0]["lr"]
 
-    va_loss, va_acc, _, _ = eval_epoch(val_dl)
+    va_loss, va_acc, _, _, tta_disagree, tta_rel = eval_epoch(val_dl)
     if va_acc > best_acc:
         best_acc = va_acc
         best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
@@ -447,13 +477,19 @@ for epoch in range(1, EPOCHS + 1):
     print(
         f"epoch {epoch:02d}/{EPOCHS}  lr {lr_now:.2e}  "
         f"train loss {run_loss / max(run_n, 1):.4f} acc {run_ok / max(run_n, 1):.3f}  "
-        f"val loss {va_loss:.4f} acc {va_acc:.3f}"
+        f"val loss {va_loss:.4f} acc {va_acc:.3f}  "
+        f"tta_argmax_mismatch={tta_disagree:.3f}  tta_rel_logit_gap={tta_rel:.4f}"
     )
 
 if best_state is not None:
     model.load_state_dict(best_state)
-_, _, vp, vt = eval_epoch(val_dl)
+_, _, vp, vt, tta_disagree_final, tta_rel_final = eval_epoch(val_dl)
 print(f"\nBest val acc: {best_acc:.3f}")
+print(
+    f"Val TTA (best checkpoint): argmax mismatch rate={tta_disagree_final:.4f}  "
+    f"mean rel ||Δlogit||={tta_rel_final:.4f}  "
+    "(rel = ||orig−mirror|| / mean(||orig||,||mirror||))"
+)
 print("\nClassification report (val, best checkpoint):")
 print(
     classification_report(

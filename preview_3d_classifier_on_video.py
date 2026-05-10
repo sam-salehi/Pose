@@ -27,6 +27,7 @@ Example::
     python preview_3d_classifier_on_video.py --ver V7
     python preview_3d_classifier_on_video.py --ver V7 --no-punch
     python preview_3d_classifier_on_video.py --ver V7 --checkpoint checkpoints/punch_transformer_7cls_V1.pt
+    python preview_3d_classifier_on_video.py --ver V7 --slow-motion 2
 """
 
 from __future__ import annotations
@@ -242,6 +243,14 @@ def main() -> None:
     ap.add_argument("--max-frames", type=int, default=None, help="Cap number of output frames")
     ap.add_argument("--stride", type=int, default=1, help="Classifier stride ≥1 (2 = faster, labels forward-filled)")
     ap.add_argument("--batch-size", type=int, default=256)
+    ap.add_argument(
+        "--slow-motion",
+        type=float,
+        default=1.0,
+        metavar="FACTOR",
+        help="Slow playback: output FPS = source FPS / FACTOR (FACTOR≥1). "
+        "Example: 2 → half speed, wall-clock duration doubles.",
+    )
     ap.add_argument("--out", type=Path, default=None)
     args = ap.parse_args()
 
@@ -251,6 +260,10 @@ def main() -> None:
 
     if args.start_frac < 0 or args.start_frac > 1 or args.end_frac <= args.start_frac:
         raise SystemExit("Need 0 ≤ --start-frac < --end-frac ≤ 1")
+
+    sm = float(args.slow_motion)
+    if sm < 1.0 or not np.isfinite(sm):
+        raise SystemExit("--slow-motion must be a finite number ≥ 1 (1 = real-time)")
 
     video_path = args.video
     if video_path is None:
@@ -338,7 +351,11 @@ def main() -> None:
         encode_n = min(encode_n, int(args.max_frames))
 
     print(f"Video: {video_path.name}  pose_rows={n_pose}  video_frames={n_vid}  using_n={n_total}")
-    print(f"Encoding frames [{start_i}, {start_i + encode_n})  (stride={args.stride})")
+    out_fps = fps / sm
+    print(
+        f"Encoding frames [{start_i}, {start_i + encode_n})  "
+        f"(stride={args.stride})  source_fps={fps:.3f}  output_fps={out_fps:.3f}  slow_motion={sm:g}x"
+    )
 
     stride = max(1, int(args.stride))
     sampled = np.arange(0, n_total, stride, dtype=np.int64)
@@ -363,7 +380,7 @@ def main() -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(out_path), fourcc, fps, (fw, fh))
+    writer = cv2.VideoWriter(str(out_path), fourcc, out_fps, (fw, fh))
     if not writer.isOpened():
         raise SystemExit(f"VideoWriter failed: {out_path}")
 
@@ -382,7 +399,10 @@ def main() -> None:
             name = punch_classes[pi].replace("_", " ").title()
             line1 = f"{ver} 3D clf  |  video frame {t + 1}/{n_total}  |  ckpt {ckpt_path.name}"
             line2 = f"{name}   p={pc:.2f}"
-            line3 = f"window={clf_window}  stride={stride}  body_frame=video_frame0"
+            line3 = (
+                f"window={clf_window}  stride={stride}  body_frame=video_frame0"
+                + (f"  slow={sm:g}x" if sm > 1.0 else "")
+            )
             _overlay_banner(frame, line1, line2, line3)
             writer.write(frame)
     finally:
