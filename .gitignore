@@ -98,3 +98,62 @@ __pycache__/
 *.sqlite
 *.db
 *.bin
+
+# ------------------------------------------------------------------------------
+# Dataset/: track contents here (overrides global binary rules above).
+# Use directory negations so Git traverses the tree; then per-extension ! rules.
+# MP4 stays ignored (no !…/*.mp4); explicit rule at end reinforces that.
+# ------------------------------------------------------------------------------
+!Dataset/
+!Dataset/**/
+
+!Dataset/**/*.pdf
+!Dataset/**/*.npz
+!Dataset/**/*.npy
+!Dataset/**/*.pt
+!Dataset/**/*.pth
+!Dataset/**/*.pth.tar
+!Dataset/**/*.onnx
+!Dataset/**/*.mov
+!Dataset/**/*.avi
+!Dataset/**/*.mkv
+!Dataset/**/*.task
+!Dataset/**/*.zip
+!Dataset/**/*.tar
+!Dataset/**/*.tar.gz
+!Dataset/**/*.tgz
+!Dataset/**/*.7z
+!Dataset/**/*.rar
+!Dataset/**/*.png
+!Dataset/**/*.jpg
+!Dataset/**/*.jpeg
+!Dataset/**/*.gif
+!Dataset/**/*.webp
+!Dataset/**/*.svg
+!Dataset/**/*.ico
+!Dataset/**/*.bmp
+!Dataset/**/*.woff
+!Dataset/**/*.woff2
+!Dataset/**/*.ttf
+!Dataset/**/*.eot
+!Dataset/**/*.otf
+!Dataset/**/*.csv
+!Dataset/**/*.tsv
+!Dataset/**/*.parquet
+!Dataset/**/*.feather
+!Dataset/**/*.h5
+!Dataset/**/*.hdf5
+!Dataset/**/*.pkl
+!Dataset/**/*.pickle
+!Dataset/**/*.joblib
+!Dataset/**/*.sqlite
+!Dataset/**/*.db
+!Dataset/**/*.bin
+
+# Common annotation / metadata not covered by root whitelist
+!Dataset/**/*.json
+!Dataset/**/*.xlsx
+
+# Any other path under Dataset/ (then exclude mp4 explicitly below)
+!Dataset/**/*
+Dataset/**/*.mp4
