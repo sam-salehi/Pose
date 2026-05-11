@@ -178,16 +178,24 @@ def _load_model(ckpt_path: Path, device: torch.device) -> tuple[PunchTransformer
         raise SystemExit(f"Checkpoint missing model_state: {ckpt_path}")
     classes: list[str] = list(ckpt.get("punch_classes", PUNCH_CLASSES))
     window = int(ckpt.get("window", 8))
+    # Architecture must match training; older checkpoints omit these keys (default = small base model).
+    sh = int(ckpt.get("spatial_hidden", 64))
+    dm = int(ckpt.get("d_model", 128))
+    nh = int(ckpt.get("nhead", 4))
+    nl = int(ckpt.get("num_layers", 4))
+    df = int(ckpt.get("dim_feedforward", 256))
+    do = float(ckpt.get("dropout", 0.2))
+    in_ch = int(ckpt.get("in_channels", 6))
     model = PunchTransformer(
         num_classes=len(classes),
-        in_channels=6,
+        in_channels=in_ch,
         edges=H36M_BONE_PAIRS,
-        spatial_hidden=64,
-        d_model=128,
-        nhead=4,
-        num_layers=4,
-        dim_feedforward=256,
-        dropout=0.1,
+        spatial_hidden=sh,
+        d_model=dm,
+        nhead=nh,
+        num_layers=nl,
+        dim_feedforward=df,
+        dropout=do,
     )
     model.load_state_dict(state)
     model.eval()

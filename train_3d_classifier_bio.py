@@ -60,6 +60,14 @@ SEED = 42
 GRAD_CLIP_MAX_NORM = 1.0
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# PunchTransformer backbone — match train_3d_classifier_no_punch.py (large config)
+MODEL_SPATIAL_HIDDEN = 96
+MODEL_D_MODEL = 256
+MODEL_NHEAD = 8
+MODEL_NUM_LAYERS = 5
+MODEL_DIM_FEEDFORWARD = 512
+MODEL_DROPOUT = 0.25
+
 CLASSIFIER_CLASSES: list[str] = [*PUNCH_CLASSES, "no_punch"]
 NO_PUNCH_IDX = len(PUNCH_CLASSES)
 NO_PUNCH_MIN_GAP_FRAMES = 16
@@ -516,12 +524,12 @@ model = PunchTransformer(
     num_classes=len(CLASSIFIER_CLASSES),
     in_channels=IN_CHANNELS,
     edges=H36M_BONE_PAIRS,
-    spatial_hidden=64,
-    d_model=128,
-    nhead=4,
-    num_layers=4,
-    dim_feedforward=256,
-    dropout=0.2,
+    spatial_hidden=MODEL_SPATIAL_HIDDEN,
+    d_model=MODEL_D_MODEL,
+    nhead=MODEL_NHEAD,
+    num_layers=MODEL_NUM_LAYERS,
+    dim_feedforward=MODEL_DIM_FEEDFORWARD,
+    dropout=MODEL_DROPOUT,
 ).to(DEVICE)
 
 print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -649,6 +657,12 @@ torch.save(
         "label_map":         _LABEL_TO_IDX,
         "window":            CLF_WINDOW,
         "in_channels":       IN_CHANNELS,
+        "spatial_hidden":    MODEL_SPATIAL_HIDDEN,
+        "d_model":           MODEL_D_MODEL,
+        "nhead":             MODEL_NHEAD,
+        "num_layers":        MODEL_NUM_LAYERS,
+        "dim_feedforward":   MODEL_DIM_FEEDFORWARD,
+        "dropout":           MODEL_DROPOUT,
         "skeleton":          "H36M-17",
         "source":            "MotionBERT_3d",
         "preprocessing": (
