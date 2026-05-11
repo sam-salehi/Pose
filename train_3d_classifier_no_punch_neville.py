@@ -30,7 +30,7 @@ from sklearn.model_selection import train_test_split
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, Dataset
 
-from GCN import (
+from skeleton_constants import (
     H36M_BONE_PAIRS,
     PUNCH_CLASSES,
     make_class_weights,

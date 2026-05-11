@@ -26,7 +26,7 @@ from sklearn.model_selection import train_test_split
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, Dataset
 
-from GCN import (
+from skeleton_constants import (
     H36M_BONE_PAIRS,
     PUNCH_CLASSES,
     make_class_weights,
@@ -48,7 +48,7 @@ JITTER_RANGE = 2  # ± frames shifted from centre during training
 EPOCHS = 100
 BATCH_SIZE = 64
 LR = 1e-3
-LR_MIN = 1e-5
+LR_MIN = 1e-6
 WARMUP_EPOCHS = 5
 VAL_FRAC = 0.1
 SEED = 42

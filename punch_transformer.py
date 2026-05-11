@@ -31,7 +31,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from GCN import (
+from skeleton_constants import (
     H36M_BONE_PAIRS,
     NUM_H36M_JOINTS,
     PUNCH_CLASSES,

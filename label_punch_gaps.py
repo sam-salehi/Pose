@@ -40,7 +40,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from GCN import PUNCH_CLASSES
+from skeleton_constants import PUNCH_CLASSES
 from preprocess import _find_video, _load_annotations, _normalize_label
 
 _REPO = Path(__file__).resolve().parent

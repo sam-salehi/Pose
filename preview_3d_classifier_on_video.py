@@ -41,7 +41,7 @@ import cv2
 import numpy as np
 import torch
 
-from GCN import H36M_BONE_PAIRS, PUNCH_CLASSES
+from skeleton_constants import H36M_BONE_PAIRS, PUNCH_CLASSES
 from preprocess import _find_video
 from punch_transformer import PunchTransformer
 
