@@ -1,10 +1,20 @@
 #!/usr/bin/env python3
 """
-Review annotation quality for one workbook (V1–V10).
+Review annotation quality for one workbook (``Vx``).
 
 Loads ``Dataset/Annotation_files/{VER}.xlsx``, finds the matching RGB MP4, then
-plays each annotated segment in order with the label overlaid. Default playback
-is slower than realtime so you can judge timing and labels.
+plays each annotated segment with the label overlaid. Default playback is slower
+than realtime so you can judge timing and labels.
+
+**Frames vs Excel (BoxIV-style convention, same as ``train.ipynb`` / preprocess):**
+spreadsheet ``start`` and ``end`` are **1-based inclusive** indices into the
+decoded MP4 (frame ``1`` = first frame). Internally we use 0-based ``i0..i1``
+inclusive.
+
+**Alignment:** ``cv2.VideoCapture.set(CAP_PROP_POS_FRAMES)`` is unreliable on
+many H.264/MP4 files (keyframe snapping). By default this script **decodes
+sequentially** so on-screen frames match Excel; use ``--fast-seek`` for the old
+seek-based path (faster, may drift).
 
 GUI: **q** / **Esc** quit entire run · **n** skip to next clip
 
@@ -14,6 +24,7 @@ Example::
     python eval.py V7 --speed 0.2
     python eval.py V3 --limit 5
     python eval.py V1 --export-dir figures/eval_V1   # headless: write MP4s
+    python eval.py V7 --fast-seek                   # fast OpenCV seek (may drift)
 """
 
 from __future__ import annotations
@@ -42,9 +53,9 @@ def _normalize_ver(raw: str) -> str:
         if not s.startswith("V"):
             s = "V" + s
         n = int(s[1:])
-        if 1 <= n <= 10:
+        if n >= 1:
             return f"V{n}"
-    raise SystemExit(f"Expected workbook V1…V10, got {raw!r}")
+    raise SystemExit(f"Expected workbook tag like V7 or 7, got {raw!r}")
 
 
 def main() -> None:
@@ -92,6 +103,14 @@ def main() -> None:
         action="store_true",
         help="Do not open a window; write clips to --export-dir (required unless GUI works).",
     )
+    ap.add_argument(
+        "--fast-seek",
+        action="store_true",
+        help=(
+            "Use OpenCV frame-index seek (fast; often misaligned on compressed MP4). "
+            "Default: sequential decode so 1-based Excel frames match the video."
+        ),
+    )
     args = ap.parse_args()
 
     ver = _normalize_ver(args.ver)
@@ -115,6 +134,15 @@ def main() -> None:
     if args.limit is not None:
         rows = rows[: max(0, args.limit)]
 
+    if args.shuffle and not args.fast_seek:
+        print(
+            "note: clips are sorted by start frame for sequential decode "
+            "(shuffle only affects which subset --limit keeps).",
+            file=sys.stderr,
+        )
+    # Time order so we can decode forward without rewinding; tie-break stabilizes overlaps.
+    rows = sorted(rows, key=lambda r: (int(r[0]), int(r[1])))
+
     video_path = _find_video(ver)
     if video_path is None:
         raise SystemExit(
@@ -129,27 +157,27 @@ def main() -> None:
         print(f"No GUI — writing clips to {out_root.resolve()}\n", file=sys.stderr)
 
     total = len(rows)
+    decode_mode = "fast seek (may drift)" if args.fast_seek else "sequential (frame-accurate)"
     print(
         f"{ver}: {total} clip(s) from {xlsx.name}  |  video: {video_path.name}\n"
-        f"speed={args.speed}x  |  [n] next  [q/Esc] quit\n",
+        f"decode={decode_mode}  |  speed={args.speed}x  |  [n] next  [q/Esc] quit\n",
         file=sys.stderr,
     )
 
     cap = cv2.VideoCapture(str(video_path))
     fps = float(cap.get(cv2.CAP_PROP_FPS) or 24.0)
     delay_ms = max(1, int(1000.0 / fps / args.speed))
+    decoder_next = 0
 
     try:
         for idx, (s1, e1, label) in enumerate(rows, 1):
-            i0, i1 = s1 - 1, e1 - 1
+            i0, i1 = int(s1) - 1, int(e1) - 1
             t0, t1 = i0 / fps, i1 / fps
             tag = (
-                f"[{idx}/{total}] {ver} | {label} | frames {s1}–{e1} "
-                f"({t0:.2f}s–{t1:.2f}s)"
+                f"[{idx}/{total}] {ver} | {label} | Excel frames {s1}–{e1} (1-based) "
+                f"| decode {i0}–{i1} (0-based) | {t0:.2f}s–{t1:.2f}s"
             )
             print(tag, file=sys.stderr)
-
-            cap.set(cv2.CAP_PROP_POS_FRAMES, i0)
 
             writer: cv2.VideoWriter | None = None
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -160,11 +188,33 @@ def main() -> None:
             )
 
             skip_clip = False
+            if args.fast_seek:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, float(i0))
+            else:
+                if i0 < decoder_next:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0.0)
+                    decoder_next = 0
+                while decoder_next < i0:
+                    ok_skip, _ = cap.read()
+                    if not ok_skip:
+                        print(
+                            f"  warning: EOF before frame {i0} "
+                            f"(at decoder {decoder_next})",
+                            file=sys.stderr,
+                        )
+                        skip_clip = True
+                        break
+                    decoder_next += 1
+            if skip_clip:
+                continue
+
             for fi in range(i0, i1 + 1):
                 ok, frame = cap.read()
                 if not ok:
-                    print(f"  warning: could not read frame {fi}", file=sys.stderr)
+                    print(f"  warning: could not read frame index {fi}", file=sys.stderr)
                     break
+                if not args.fast_seek:
+                    decoder_next += 1
 
                 h, w = frame.shape[:2]
                 cv2.rectangle(frame, (0, 0), (w, 72), (0, 0, 0), -1)
@@ -178,7 +228,10 @@ def main() -> None:
                     2,
                     cv2.LINE_AA,
                 )
-                line2 = f"frame {fi + 1} (file)  |  in-clip {fi - i0 + 1}/{e1 - s1 + 1}"
+                line2 = (
+                    f"Excel frame {fi + 1} (1-based)  |  decode idx {fi}  |  "
+                    f"in-clip {fi - i0 + 1}/{e1 - s1 + 1}"
+                )
                 cv2.putText(
                     frame,
                     line2[:130],

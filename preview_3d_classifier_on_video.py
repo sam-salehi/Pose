@@ -19,8 +19,9 @@ classification, overlay predicted class + probability on the RGB MP4.
 
 Default: encode **from the middle** (``--start-frac 0.5``); use ``--start-frac 0`` for full video.
 
-Preprocessing: full sequence, body frame from video frame 0, torso scale, velocities —
-then each frame uses a window centered on that frame (inference; no train-time jitter).
+Preprocessing matches ``train_3d_classifier_no_punch``: each sliding window uses **only**
+that window's raw ``X3D`` frames, then body frame + median torso scale + velocity with
+**reference = first frame of the window** (not global video frame 0).
 
 Example::
 
@@ -84,9 +85,9 @@ def _scale_normalize(q: np.ndarray) -> np.ndarray:
     return q / torso if torso > 1e-6 else q
 
 
-def _preprocess_full_sequence(poses_xyz: np.ndarray) -> np.ndarray:
-    """``poses_xyz`` (T, 17, 3) raw MotionBERT → (T, 17, 6); scaling matches ``train_3d_classifier_no_punch``."""
-    q = _to_body_frame(poses_xyz.astype(np.float64))
+def _preprocess_clip(clip_xyz: np.ndarray) -> np.ndarray:
+    """Raw window ``(T, 17, 3)`` → ``(T, 17, 6)`` — same contract as training ``_preprocess_clip``."""
+    q = _to_body_frame(clip_xyz.astype(np.float64))
     q = _scale_normalize(q)
     q = q.astype(np.float32)
     vel = np.zeros_like(q)
@@ -197,20 +198,27 @@ def _load_model(ckpt_path: Path, device: torch.device) -> tuple[PunchTransformer
 @torch.no_grad()
 def _predict_windows_batched(
     model: PunchTransformer,
-    seq: np.ndarray,
+    raw_xyz: np.ndarray,
     window: int,
     centers: np.ndarray,
     device: torch.device,
     batch_size: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return (pred_idx [N], max_prob [N]) for each center index."""
+    """Return (pred_idx [N], max_prob [N]) for each center index.
+
+    ``raw_xyz`` is ``(T, 17, 3)`` MotionBERT output. Each window is preprocessed
+    **locally** (body frame from window start) like ``train_3d_classifier_no_punch``.
+    """
     n = centers.shape[0]
     preds = np.empty(n, dtype=np.int64)
     probs = np.empty(n, dtype=np.float32)
     k = 0
     while k < n:
         batch_c = centers[k: k + batch_size]
-        chunks = [_window_centered_at(seq, window, int(c)) for c in batch_c]
+        chunks = [
+            _preprocess_clip(_window_centered_at(raw_xyz, window, int(c)))
+            for c in batch_c
+        ]
         xb = torch.stack([torch.from_numpy(c) for c in chunks]).to(device)
         logits = model(xb)
         pr = torch.softmax(logits, dim=-1).cpu().numpy()
@@ -327,7 +335,6 @@ def main() -> None:
         raise SystemExit(f"Expected X3D (T,17,3), got {raw.shape}")
 
     n_pose = raw.shape[0]
-    seq = _preprocess_full_sequence(raw)
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -360,7 +367,7 @@ def main() -> None:
     stride = max(1, int(args.stride))
     sampled = np.arange(0, n_total, stride, dtype=np.int64)
     pr_idx, pr_pb = _predict_windows_batched(
-        model, seq, clf_window, sampled, device, args.batch_size,
+        model, raw, clf_window, sampled, device, args.batch_size,
     )
 
     pred_s = np.empty(n_total, dtype=np.int64)
@@ -400,7 +407,7 @@ def main() -> None:
             line1 = f"{ver} 3D clf  |  video frame {t + 1}/{n_total}  |  ckpt {ckpt_path.name}"
             line2 = f"{name}   p={pc:.2f}"
             line3 = (
-                f"window={clf_window}  stride={stride}  body_frame=video_frame0"
+                f"window={clf_window}  stride={stride}  body_frame=window_local"
                 + (f"  slow={sm:g}x" if sm > 1.0 else "")
             )
             _overlay_banner(frame, line1, line2, line3)
