@@ -42,9 +42,9 @@ _REPO = Path.cwd().resolve()
 _MOTIONBERT_DIR = _REPO / "Dataset" / "MotionBERT_3d"
 _ANNOTATION_DIR = _REPO / "Dataset" / "Annotation_files"
 
-CLF_WINDOW = 48
+CLF_WINDOW = 24
 JITTER_RANGE = 6
-EPOCHS = 50
+EPOCHS = 100
 BATCH_SIZE = 256
 LR = 1e-3
 LR_MIN = 1e-5
