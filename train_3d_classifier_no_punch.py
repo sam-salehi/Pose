@@ -1,7 +1,8 @@
 # Same as train_3d_classifier.py but 7 classes: six punch types + no_punch.
 # Positives: annotated punch clips (same as before).
-# Negatives: contiguous frame ranges between ALL xlsx intervals (any label) —
-#   merged to busy ranges, then gaps are mined as no-punch sequences.
+# Negatives: entries with label == "no_punch" in Dataset/gap_labels/gap_review.json
+#   (from label_punch_gaps.py). Per labeled span [start,end), take exactly two raw
+#   windows (flush-left and flush-right when the span is longer than CLF_WINDOW).
 #
 # Augmentations (training only):
 #   - Temporal jitter: random ±JITTER_RANGE frames on window centre
@@ -9,12 +10,18 @@
 
 from __future__ import annotations
 
+import json
 from collections import Counter
 from pathlib import Path
 
 import numpy as np
 import torch
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import (
+    balanced_accuracy_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+)
 from sklearn.model_selection import train_test_split
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, Dataset
@@ -30,10 +37,15 @@ from preprocess import _load_annotations, _normalize_label
 _REPO = Path.cwd().resolve()
 _MOTIONBERT_DIR = _REPO / "Dataset" / "MotionBERT_3d"
 _ANNOTATION_DIR = _REPO / "Dataset" / "Annotation_files"
+_GAP_REVIEW_JSON = _REPO / "Dataset" / "gap_labels" / "gap_review.json"
+
+# Only these subdirs of MotionBERT_3d are loaded (name matched case-insensitively).
+# Default is V1–V10; remove names from the set to skip sessions.
+USE_VERSIONS: frozenset[str] = frozenset(f"V{i}" for i in range(3, 11))
 
 CLF_WINDOW = 16
 JITTER_RANGE = 2  # ± frames shifted from centre during training
-EPOCHS = 50
+EPOCHS = 100
 BATCH_SIZE = 64
 LR = 1e-3
 LR_MIN = 1e-5
@@ -47,8 +59,8 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CLASSIFIER_CLASSES: list[str] = [*PUNCH_CLASSES, "no_punch"]
 NO_PUNCH_IDX = len(PUNCH_CLASSES)
 
-# Gaps shorter than this (frames) are skipped — avoids tiny slivers between annotations.
-NO_PUNCH_MIN_GAP_FRAMES = 16
+# Raw frame windows taken per gap_review.json ``no_punch`` span [start, end).
+NO_PUNCH_SAMPLES_PER_GAP_SPAN = 2
 
 _J_PELVIS = 0
 _J_THORAX = 8
@@ -68,67 +80,44 @@ _LABEL_TO_IDX: dict[str, int] = {
 _FLIP_JOINT_ORDER = [0, 4, 5, 6, 1, 2, 3, 7, 8, 9, 10, 14, 15, 16, 11, 12, 13]
 
 
-def _merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
-    if not intervals:
-        return []
-    intervals = sorted(intervals)
-    out: list[tuple[int, int]] = [intervals[0]]
-    for a, b in intervals[1:]:
-        la, lb = out[-1]
-        if a <= lb:
-            out[-1] = (la, max(lb, b))
-        else:
-            out.append((a, b))
-    return out
+def _no_punch_spans_from_gap_review() -> list[tuple[str, int, int]]:
+    """``(workbook, start, end)`` half-open frame indices for each no_punch chunk (USE_VERSIONS only)."""
+    if not _GAP_REVIEW_JSON.is_file():
+        raise SystemExit(f"Missing {_GAP_REVIEW_JSON} — run label_punch_gaps.py")
+    data = json.loads(_GAP_REVIEW_JSON.read_text(encoding="utf-8"))
+    rows: list[tuple[str, int, int]] = []
+    for e in data.get("entries", []):
+        if e.get("label") != "no_punch":
+            continue
+        ver = str(e["workbook"]).strip().upper()
+        if ver not in USE_VERSIONS:
+            continue
+        s0, e0 = int(e["start"]), int(e["end"])
+        if e0 > s0:
+            rows.append((ver, s0, e0))
+    return rows
 
 
-def _gaps_from_busy(busy: list[tuple[int, int]], n_total: int) -> list[tuple[int, int]]:
-    """Return maximal gaps [g0,g1) with 0 <= g0 < g1 <= n_total."""
-    gaps: list[tuple[int, int]] = []
-    cur = 0
-    for a, b in busy:
-        a = max(0, min(a, n_total))
-        b = max(0, min(b, n_total))
-        if a > cur:
-            gaps.append((cur, a))
-        cur = max(cur, b)
-    if cur < n_total:
-        gaps.append((cur, n_total))
-    return gaps
-
-
-def _no_punch_gap_raw_spans(g0: int, g1: int, window: int, stride: int) -> list[tuple[int, int]]:
+def _two_raw_spans_for_no_punch(g0: int, g1: int, window: int) -> list[tuple[int, int]]:
     """
-    Half-open gap ``[g0, g1)`` in raw frame indices.
+    Exactly two half-open [a, b) slices into ``frames[a:b]`` within ``[g0, g1)``.
 
-    If shorter than ``window``, one span ``(g0, g1)`` (may pad during windowing).
-    Otherwise sliding windows ``[s, s+window)`` stepping by ``stride``, plus a final
-    window flush to ``g1`` when the stride grid leaves a tail.
+    Long spans: first window flush-left, second flush-right (same as two disjoint
+    placements when ``g1 - g0 > window``). Short spans: the available span is used
+    twice (padding happens in ``_prepare_window_3d``).
     """
     L = g1 - g0
+    if L <= 0:
+        return []
     if L < window:
-        return [(g0, g1)]
-    spans: list[tuple[int, int]] = []
-    s = g0
-    while s + window <= g1:
-        spans.append((s, s + window))
-        s += stride
-    tail_start = g1 - window
-    if not spans:
-        return [(tail_start, g1)]
-    if spans[-1][0] < tail_start:
-        spans.append((tail_start, g1))
-    return spans
-
-
-def _busy_intervals_from_xlsx(annotations: list[tuple[int, int, str]], n_total: int) -> list[tuple[int, int]]:
-    """All annotated spans (any label), same convention as load_3d_clips: s0=s-1, e0=min(e,n_total)."""
-    raw: list[tuple[int, int]] = []
-    for s, e, _raw_label in annotations:
-        s0, e0 = s - 1, min(e, n_total)
-        if e0 > s0:
-            raw.append((s0, e0))
-    return _merge_intervals(raw)
+        sp = (g0, g1)
+        return [sp, sp]
+    last_start = g1 - window
+    first_start = g0
+    if last_start <= first_start:
+        sp = (g0, g0 + window)
+        return [sp, sp]
+    return [(first_start, first_start + window), (last_start, g1)]
 
 
 # =============================================================================
@@ -213,26 +202,29 @@ def _prepare_window_3d(seq: np.ndarray, window: int, jitter: int = 0) -> np.ndar
     return chunk
 
 
-def load_3d_clips_with_negatives() -> tuple[list[np.ndarray], np.ndarray]:
+def load_3d_clips_with_negatives() -> tuple[list[np.ndarray], np.ndarray, list[str]]:
     """
-    Punch clips from annotated rows (known punch labels) + no_punch clips from
-    inter-annotation gaps in each workbook.
+    Punch clips from annotated rows (known punch types) + ``no_punch`` from
+    ``gap_review.json`` only.
 
-    Long gaps yield multiple negatives: sliding raw-frame windows of length
-    ``CLF_WINDOW`` with stride ``max(1, CLF_WINDOW // 2)``, plus a tail window
-    aligned to the gap end when needed. Short gaps (still ≥ ``NO_PUNCH_MIN_GAP_FRAMES``
-    but ``< CLF_WINDOW``) contribute one clip ``[g0, g1)``.
+    For each JSON span labeled ``no_punch``, add ``NO_PUNCH_SAMPLES_PER_GAP_SPAN``
+    clips via ``_two_raw_spans_for_no_punch``.
     """
     clips: list[np.ndarray] = []
     y_list: list[int] = []
 
-    n_punch, n_gap = 0, 0
+    n_punch, n_np = 0, 0
+    trained_versions: set[str] = set()
 
     for ver_dir in sorted(_MOTIONBERT_DIR.iterdir()):
+        if not ver_dir.is_dir():
+            continue
+        ver = ver_dir.name.upper()
+        if ver not in USE_VERSIONS:
+            continue
         npy_path = ver_dir / "X3D.npy"
         if not npy_path.exists():
             continue
-        ver = ver_dir.name.upper()
         ann_path = _ANNOTATION_DIR / f"{ver}.xlsx"
         if not ann_path.exists():
             print(f"[skip] no annotation file for {ver}")
@@ -241,9 +233,6 @@ def load_3d_clips_with_negatives() -> tuple[list[np.ndarray], np.ndarray]:
         frames = np.load(npy_path)
         annotations = _load_annotations(ann_path)
         n_total = frames.shape[0]
-
-        busy = _busy_intervals_from_xlsx(annotations, n_total)
-        gaps = _gaps_from_busy(busy, n_total)
 
         kept_p = 0
         for s, e, raw_label in annotations:
@@ -259,29 +248,56 @@ def load_3d_clips_with_negatives() -> tuple[list[np.ndarray], np.ndarray]:
             kept_p += 1
             n_punch += 1
 
-        kept_g = 0
-        slide_stride = max(1, CLF_WINDOW // 2)
-        for g0, g1 in gaps:
-            if g1 - g0 < NO_PUNCH_MIN_GAP_FRAMES:
-                continue
-            for a, b in _no_punch_gap_raw_spans(g0, g1, CLF_WINDOW, slide_stride):
-                clip = _preprocess_clip(frames[a:b].copy())
-                clips.append(clip)
-                y_list.append(NO_PUNCH_IDX)
-                kept_g += 1
-                n_gap += 1
-
-        print(f"{ver}: punches {kept_p}/{len(annotations)}  no_punch windows {kept_g}")
+        trained_versions.add(ver)
+        print(f"{ver}: punches {kept_p}/{len(annotations)} (xlsx)")
 
     if not clips:
-        raise SystemExit("No 3D clips found — check Dataset/MotionBERT_3d/ structure.")
-    if n_gap == 0:
+        raise SystemExit("No 3D punch clips — check Annotation_files and MotionBERT_3d.")
+
+    spans = _no_punch_spans_from_gap_review()
+    if not spans:
         raise SystemExit(
-            "No no_punch gaps — widen annotations or lower NO_PUNCH_MIN_GAP_FRAMES."
+            f"No no_punch entries for USE_VERSIONS in {_GAP_REVIEW_JSON} — run label_punch_gaps.py"
         )
 
-    print(f"\nTotal punch clips: {n_punch}  no_punch clips: {n_gap}")
-    return clips, np.array(y_list, dtype=np.int64)
+    cache: dict[str, np.ndarray] = {}
+    skipped = 0
+    for ver, s0, e0 in spans:
+        npy_path = _MOTIONBERT_DIR / ver / "X3D.npy"
+        if not npy_path.exists():
+            skipped += 1
+            continue
+        if ver not in cache:
+            cache[ver] = np.load(npy_path)
+        frames = cache[ver]
+        n_total = frames.shape[0]
+        e0 = min(e0, n_total)
+        s0 = max(0, s0)
+        if e0 <= s0:
+            skipped += 1
+            continue
+        raws = _two_raw_spans_for_no_punch(s0, e0, CLF_WINDOW)
+        if len(raws) != NO_PUNCH_SAMPLES_PER_GAP_SPAN:
+            skipped += 1
+            continue
+        for a, b in raws:
+            clip = _preprocess_clip(frames[a:b].copy())
+            clips.append(clip)
+            y_list.append(NO_PUNCH_IDX)
+            n_np += 1
+        trained_versions.add(ver)
+
+    print(
+        f"gap_review.json: {n_np} no_punch clips from {len(spans)} labeled spans "
+        f"({skipped} spans skipped — missing X3D or out of range)"
+    )
+    if n_np == 0:
+        raise SystemExit(
+            "Could not load any no_punch clips — check gap_review vs MotionBERT_3d and USE_VERSIONS."
+        )
+
+    print(f"\nTotal punch clips: {n_punch}  no_punch clips: {n_np}")
+    return clips, np.array(y_list, dtype=np.int64), sorted(trained_versions)
 
 
 class Clf3DDataset(Dataset):
@@ -319,6 +335,21 @@ class Clf3DDataset(Dataset):
         return torch.from_numpy(win), torch.tensor(label, dtype=torch.long)
 
 
+def _extended_val_summary(vt: np.ndarray, vp: np.ndarray) -> str:
+    """Metrics less dominated by majority ``no_punch`` than plain accuracy."""
+    vt = np.asarray(vt)
+    vp = np.asarray(vp)
+    bal = balanced_accuracy_score(vt, vp)
+    f7 = f1_score(vt, vp, average="macro", zero_division=0)
+    f6 = f1_score(vt, vp, average="macro", labels=list(range(6)), zero_division=0)
+    pm = vt != NO_PUNCH_IDX
+    acc_on_punch = float((vp[pm] == vt[pm]).mean()) if np.any(pm) else float("nan")
+    return (
+        f"val_bal_acc={bal:.3f}  val_macroF1_7cls={f7:.3f}  "
+        f"val_macroF1_6punch={f6:.3f}  val_acc_true_punch={acc_on_punch:.3f}"
+    )
+
+
 def _display_class_name(c: str) -> str:
     if c == "no_punch":
         return "No Punch"
@@ -333,9 +364,12 @@ if not _MOTIONBERT_DIR.is_dir():
     raise SystemExit(f"Missing: {_MOTIONBERT_DIR}")
 if not _ANNOTATION_DIR.is_dir():
     raise SystemExit(f"Missing: {_ANNOTATION_DIR}")
+if not USE_VERSIONS:
+    raise SystemExit("USE_VERSIONS is empty — add at least one session folder name.")
 
-print(f"Loading 3D clips (+ no_punch gaps) from {_MOTIONBERT_DIR.relative_to(_REPO)} …")
-all_clips, all_y = load_3d_clips_with_negatives()
+print(f"USE_VERSIONS ({len(USE_VERSIONS)}): {', '.join(sorted(USE_VERSIONS))}")
+print(f"Loading punches (xlsx) + no_punch ({_GAP_REVIEW_JSON.relative_to(_REPO)}) …")
+all_clips, all_y, trained_versions = load_3d_clips_with_negatives()
 print(f"\nLoaded {len(all_y)} clips  device={DEVICE}")
 print(
     "Class distribution:",
@@ -469,7 +503,7 @@ for epoch in range(1, EPOCHS + 1):
     sched.step()
     lr_now = opt.param_groups[0]["lr"]
 
-    va_loss, va_acc, _, _, tta_disagree, tta_rel = eval_epoch(val_dl)
+    va_loss, va_acc, vp, vt, tta_disagree, tta_rel = eval_epoch(val_dl)
     if va_acc > best_acc:
         best_acc = va_acc
         best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
@@ -478,13 +512,20 @@ for epoch in range(1, EPOCHS + 1):
         f"epoch {epoch:02d}/{EPOCHS}  lr {lr_now:.2e}  "
         f"train loss {run_loss / max(run_n, 1):.4f} acc {run_ok / max(run_n, 1):.3f}  "
         f"val loss {va_loss:.4f} acc {va_acc:.3f}  "
-        f"tta_argmax_mismatch={tta_disagree:.3f}  tta_rel_logit_gap={tta_rel:.4f}"
+        f"tta_argmax_mismatch={tta_disagree:.3f}  tta_rel_logit_gap={tta_rel:.4f}\n"
+        f"         {_extended_val_summary(vt, vp)}"
     )
 
 if best_state is not None:
     model.load_state_dict(best_state)
 _, _, vp, vt, tta_disagree_final, tta_rel_final = eval_epoch(val_dl)
 print(f"\nBest val acc: {best_acc:.3f}")
+print(_extended_val_summary(vt, vp))
+print(
+    "macroF1_6punch: macro-averaged F1 over the six punch labels (includes rows whose "
+    "true label is no_punch when scoring punch-class predictions). "
+    "acc_true_punch: accuracy restricted to val samples whose ground truth is a punch."
+)
 print(
     f"Val TTA (best checkpoint): argmax mismatch rate={tta_disagree_final:.4f}  "
     f"mean rel ||Δlogit||={tta_rel_final:.4f}  "
@@ -501,11 +542,7 @@ print(
 )
 print("Confusion matrix:\n", confusion_matrix(vt, vp))
 
-vers_tag = "_".join(
-    v.name.upper()
-    for v in sorted(_MOTIONBERT_DIR.iterdir())
-    if (v / "X3D.npy").exists()
-)
+vers_tag = "_".join(trained_versions)
 ckpt = _REPO / "checkpoints" / f"punch_transformer_7cls_{vers_tag}.pt"
 ckpt.parent.mkdir(parents=True, exist_ok=True)
 torch.save(
@@ -522,8 +559,8 @@ torch.save(
         "source": "MotionBERT_3d",
         "preprocessing": "body_frame + torso_scale",
         "negatives": (
-            f"gaps between xlsx intervals, min_gap={NO_PUNCH_MIN_GAP_FRAMES}, "
-            f"sliding raw windows len={CLF_WINDOW} stride={max(1, CLF_WINDOW // 2)}"
+            f"gap_review.json (label=no_punch) @ {_GAP_REVIEW_JSON.relative_to(_REPO)}; "
+            f"{NO_PUNCH_SAMPLES_PER_GAP_SPAN} raw windows per span; USE_VERSIONS filter"
         ),
         "grad_clip_max_norm": GRAD_CLIP_MAX_NORM,
         "augmentation": (
