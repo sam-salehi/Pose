@@ -50,7 +50,7 @@ USE_VERSIONS: frozenset[str] = frozenset(f"V{i}" for i in range(1, 11))
 
 CLF_WINDOW = 16
 JITTER_RANGE = 2
-EPOCHS = 50
+EPOCHS = 200
 BATCH_SIZE = 64
 LR = 1e-3
 LR_MIN = 1e-5
