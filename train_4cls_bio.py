@@ -1,15 +1,21 @@
-# Biomechanics-augmented variant of train_3d_classifier_no_punch.py.
+# 4-class biomechanics classifier: jab_punch | hook | uppercut | no_punch.
+#
+# Collapsed from the 7-class bio variant by merging lead/rear pairs:
+#   jab_punch  = jab + cross
+#   hook       = lead_hook + rear_hook
+#   uppercut   = lead_uppercut + rear_uppercut
 #
 # Per-joint channels (9): pos(3) + vel(3) + acc(3)  [Savitzky-Golay smoothed]
 # Scalar features (6) broadcast to every joint:
-#   l_elbow_angle, r_elbow_angle  — elbow flexion (Ref: MDPI/PubMed on elbow contribution)
+#   l_elbow_angle, r_elbow_angle  — elbow flexion
 #   hip_yaw, shoulder_yaw         — girdle orientations in body frame
 #   xfactor                       — shoulder_yaw − hip_yaw (kinetic-chain separation)
 #   com_z                         — mean joint z (vertical loading proxy)
 # Total in_channels = 15.
 #
-# Mirror augmentation flips lead↔rear labels and permutes TTA logits accordingly
-# so averaging original + mirrored predictions is coherent across all 7 classes.
+# Mirror augmentation flips the pose but since lead/rear are merged the label
+# is unchanged — it acts as a pure pose-diversity augmentation (no permutation needed).
+# TTA mirror averaging still reduces prediction variance.
 
 from __future__ import annotations
 
@@ -31,7 +37,6 @@ from torch.utils.data import DataLoader, Dataset
 
 from skeleton_constants import (
     H36M_BONE_PAIRS,
-    PUNCH_CLASSES,
     make_class_weights,
 )
 from punch_transformer import PunchTransformer
@@ -48,7 +53,8 @@ _MOTIONBERT_DIR = _REPO / "Dataset" / "MotionBERT_3d"
 _ANNOTATION_DIR = _REPO / "Dataset" / "Annotation_files"
 _GAP_REVIEW_JSON = _REPO / "Dataset" / "gap_labels" / "gap_review.json"
 
-USE_VERSIONS: frozenset[str] = frozenset(f"V{i}" for i in range(3, 11))
+TRAIN_VERSIONS: frozenset[str] = frozenset(f"V{i}" for i in range(5, 11))
+TEST_VERSION:   str             = "V4"
 
 CLF_WINDOW = 16
 JITTER_RANGE = 2
@@ -57,13 +63,12 @@ BATCH_SIZE = 64
 LR = 1e-3
 LR_MIN = 1e-5
 WARMUP_EPOCHS = 5
-EARLY_STOP_PATIENCE = 100  # stop if val acc does not improve for this many epochs in a row
+EARLY_STOP_PATIENCE = 20
 VAL_FRAC = 0.1
 SEED = 42
 GRAD_CLIP_MAX_NORM = 1.0
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# PunchTransformer backbone — match train_3d_classifier_no_punch.py (large config)
 MODEL_SPATIAL_HIDDEN = 96
 MODEL_D_MODEL = 128
 MODEL_NHEAD = 4
@@ -71,10 +76,9 @@ MODEL_NUM_LAYERS = 5
 MODEL_DIM_FEEDFORWARD = 256
 MODEL_DROPOUT = 0.25
 
-CLASSIFIER_CLASSES: list[str] = [*PUNCH_CLASSES, "no_punch"]
-NO_PUNCH_IDX = len(PUNCH_CLASSES)
-# Raw windows per gap_review.json ``no_punch`` span [start,end) — flush-left + flush-right
-NO_PUNCH_SAMPLES_PER_GAP_SPAN = 2
+# 4 output classes
+CLASSIFIER_CLASSES: list[str] = ["jab_punch", "hook", "uppercut", "no_punch"]
+NO_PUNCH_IDX = 3
 
 # ── H36M-17 joint indices ────────────────────────────────────────────────────
 _J_PELVIS     = 0
@@ -89,44 +93,36 @@ _J_R_ELBOW    = 15
 _J_R_WRIST    = 16
 
 # ── Feature layout ───────────────────────────────────────────────────────────
-N_SCALARS  = 6
+N_SCALARS   = 6
 IN_CHANNELS = 9 + N_SCALARS  # 15 total
 
-# Scalar channel indices within the IN_CHANNELS dim (after pos+vel+acc = 9)
-_SC_L_ELBOW    = 9
-_SC_R_ELBOW    = 10
-_SC_HIP_YAW    = 11
-_SC_SH_YAW     = 12
-_SC_XFACTOR    = 13
-_SC_COM_Z      = 14
+_SC_L_ELBOW = 9
+_SC_R_ELBOW = 10
+_SC_HIP_YAW = 11
+_SC_SH_YAW  = 12
+_SC_XFACTOR = 13
+_SC_COM_Z   = 14
 
+# Map all 6 raw punch labels to the 3 merged punch classes
 _LABEL_TO_IDX: dict[str, int] = {
-    "Cross":         PUNCH_CLASSES.index("cross"),
-    "Jab":           PUNCH_CLASSES.index("jab"),
-    "Lead Hook":     PUNCH_CLASSES.index("lead_hook"),
-    "Lead Uppercut": PUNCH_CLASSES.index("lead_uppercut"),
-    "Rear Hook":     PUNCH_CLASSES.index("rear_hook"),
-    "Rear Uppercut": PUNCH_CLASSES.index("rear_uppercut"),
+    "Jab":           0,  # jab_punch
+    "Cross":         0,  # jab_punch
+    "Lead Hook":     1,  # hook
+    "Rear Hook":     1,  # hook
+    "Lead Uppercut": 2,  # uppercut
+    "Rear Uppercut": 2,  # uppercut
 }
 
-# Swap lead↔rear when mirroring: cross↔jab, lead_hook↔rear_hook, lead_upper↔rear_upper
-# Index i maps to the label index that i becomes after a sagittal-plane mirror.
-_MIRROR_LABEL_MAP: list[int] = [
-    PUNCH_CLASSES.index("jab"),           # cross → jab
-    PUNCH_CLASSES.index("cross"),         # jab → cross
-    PUNCH_CLASSES.index("rear_hook"),     # lead_hook → rear_hook
-    PUNCH_CLASSES.index("rear_uppercut"), # lead_uppercut → rear_uppercut
-    PUNCH_CLASSES.index("lead_hook"),     # rear_hook → lead_hook
-    PUNCH_CLASSES.index("lead_uppercut"), # rear_uppercut → lead_uppercut
-    NO_PUNCH_IDX,                         # no_punch → no_punch
-]
+# Mirror (sagittal-plane flip) keeps class identity: lead/rear already merged.
+# Index i → class index after flipping.
+_MIRROR_LABEL_MAP: list[int] = [0, 1, 2, 3]  # identity
 
 # H36M-17 L/R joint swap for sagittal-plane reflection
 _FLIP_JOINT_ORDER = [0, 4, 5, 6, 1, 2, 3, 7, 8, 9, 10, 14, 15, 16, 11, 12, 13]
 
 
 # =============================================================================
-# Preprocessing
+# Preprocessing  (identical biomechanics pipeline to the 7-class variant)
 # =============================================================================
 
 def _to_body_frame(poses: np.ndarray) -> np.ndarray:
@@ -164,7 +160,6 @@ def _smooth(q: np.ndarray, window: int = 5, polyorder: int = 2) -> np.ndarray:
     T = q.shape[0]
     if not _HAS_SCIPY or T < window:
         return q
-    # polyorder must be < window
     po = min(polyorder, window - 1)
     flat = q.reshape(T, -1)
     return _savgol_fn(flat, window_length=window, polyorder=po, axis=0).reshape(q.shape)
@@ -193,14 +188,14 @@ def _preprocess_clip(clip: np.ndarray) -> np.ndarray:
       13    xfactor = shoulder_yaw − hip_yaw  (broadcast scalar)
       14    com_z          (broadcast scalar)
     """
-    q = _to_body_frame(clip.astype(np.float64))   # (T, 17, 3)
+    q = _to_body_frame(clip.astype(np.float64))
     q = _scale_normalize(q)
-    q_sm = _smooth(q)                              # noise reduction before derivatives
+    q_sm = _smooth(q)
 
     T = q_sm.shape[0]
     if T > 1:
-        vel = np.gradient(q_sm, axis=0)           # (T, 17, 3) central differences
-        acc = np.gradient(vel,  axis=0)           # (T, 17, 3)
+        vel = np.gradient(q_sm, axis=0)
+        acc = np.gradient(vel,  axis=0)
     else:
         vel = np.zeros_like(q_sm)
         acc = np.zeros_like(q_sm)
@@ -209,7 +204,7 @@ def _preprocess_clip(clip: np.ndarray) -> np.ndarray:
     r_elbow = _angle3(q_sm[:, _J_R_SHOULDER], q_sm[:, _J_R_ELBOW], q_sm[:, _J_R_WRIST])
 
     hip_vec      = q_sm[:, _J_R_HIP]      - q_sm[:, _J_L_HIP]
-    sh_vec       = q_sm[:, _J_R_SHOULDER] - q_sm[:, _J_L_SHOULDER] 
+    sh_vec       = q_sm[:, _J_R_SHOULDER] - q_sm[:, _J_L_SHOULDER]
     hip_yaw      = np.arctan2(hip_vec[:, 1], hip_vec[:, 0])
     shoulder_yaw = np.arctan2(sh_vec[:, 1],  sh_vec[:, 0])
     xfactor      = shoulder_yaw - hip_yaw
@@ -220,7 +215,7 @@ def _preprocess_clip(clip: np.ndarray) -> np.ndarray:
     )  # (T, 6)
     scalars_bc = np.broadcast_to(
         scalars[:, np.newaxis, :], (T, 17, N_SCALARS)
-    ).copy()  # (T, 17, 6)
+    ).copy()
 
     out = np.concatenate([q_sm, vel, acc, scalars_bc], axis=-1).astype(np.float32)
     return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
@@ -252,8 +247,14 @@ def _prepare_window_3d(seq: np.ndarray, window: int, jitter: int = 0) -> np.ndar
 # Data loading
 # =============================================================================
 
-def _no_punch_spans_from_gap_review() -> list[tuple[str, int, int]]:
-    """(workbook, start, end) half-open frame indices for each no_punch chunk (USE_VERSIONS only)."""
+# Raw windows per gap_review.json no_punch span — flush-left + flush-right
+_NO_PUNCH_SAMPLES_PER_GAP_SPAN = 2
+
+
+def _no_punch_spans_from_gap_review(
+    versions: frozenset[str],
+) -> list[tuple[str, int, int]]:
+    """(workbook, start, end) half-open frame indices for each no_punch chunk in ``versions``."""
     if not _GAP_REVIEW_JSON.is_file():
         raise SystemExit(f"Missing {_GAP_REVIEW_JSON} — run label_punch_gaps.py")
     data = json.loads(_GAP_REVIEW_JSON.read_text(encoding="utf-8"))
@@ -262,7 +263,7 @@ def _no_punch_spans_from_gap_review() -> list[tuple[str, int, int]]:
         if e.get("label") != "no_punch":
             continue
         ver = str(e["workbook"]).strip().upper()
-        if ver not in USE_VERSIONS:
+        if ver not in versions:
             continue
         s0, e0 = int(e["start"]), int(e["end"])
         if e0 > s0:
@@ -271,12 +272,7 @@ def _no_punch_spans_from_gap_review() -> list[tuple[str, int, int]]:
 
 
 def _two_raw_spans_for_no_punch(g0: int, g1: int, window: int) -> list[tuple[int, int]]:
-    """
-    Exactly two half-open [a, b) slices into ``frames[a:b]`` within ``[g0, g1)``.
-
-    Long spans: first window flush-left, second flush-right. Short spans: same span twice
-    (padding in ``_prepare_window_3d``).
-    """
+    """Exactly two half-open [a, b) slices within [g0, g1)."""
     L = g1 - g0
     if L <= 0:
         return []
@@ -291,10 +287,12 @@ def _two_raw_spans_for_no_punch(g0: int, g1: int, window: int) -> list[tuple[int
     return [(first_start, first_start + window), (last_start, g1)]
 
 
-def load_3d_clips_with_negatives() -> tuple[list[np.ndarray], np.ndarray, list[str]]:
+def load_3d_clips_with_negatives(
+    versions: frozenset[str],
+) -> tuple[list[np.ndarray], np.ndarray, list[str]]:
     """
-    Punch clips from xlsx annotations + ``no_punch`` only from ``gap_review.json``
-    (entries with label ``no_punch``), matching ``train_3d_classifier_no_punch.py``.
+    Punch clips from xlsx annotations merged into 3 punch classes,
+    plus no_punch from gap_review.json, restricted to ``versions``.
     """
     clips: list[np.ndarray] = []
     y_list: list[int] = []
@@ -305,7 +303,7 @@ def load_3d_clips_with_negatives() -> tuple[list[np.ndarray], np.ndarray, list[s
         if not ver_dir.is_dir():
             continue
         ver = ver_dir.name.upper()
-        if ver not in USE_VERSIONS:
+        if ver not in versions:
             continue
         npy_path = ver_dir / "X3D.npy"
         if not npy_path.exists():
@@ -338,10 +336,10 @@ def load_3d_clips_with_negatives() -> tuple[list[np.ndarray], np.ndarray, list[s
     if not clips:
         raise SystemExit("No 3D clips found — check Dataset/MotionBERT_3d/ structure.")
 
-    spans = _no_punch_spans_from_gap_review()
+    spans = _no_punch_spans_from_gap_review(versions)
     if not spans:
         raise SystemExit(
-            f"No no_punch entries for USE_VERSIONS in {_GAP_REVIEW_JSON} — run label_punch_gaps.py"
+            f"No no_punch entries for versions={versions} in {_GAP_REVIEW_JSON} — run label_punch_gaps.py"
         )
 
     cache: dict[str, np.ndarray] = {}
@@ -361,7 +359,7 @@ def load_3d_clips_with_negatives() -> tuple[list[np.ndarray], np.ndarray, list[s
             skipped += 1
             continue
         raws = _two_raw_spans_for_no_punch(s0, e0, CLF_WINDOW)
-        if len(raws) != NO_PUNCH_SAMPLES_PER_GAP_SPAN:
+        if len(raws) != _NO_PUNCH_SAMPLES_PER_GAP_SPAN:
             skipped += 1
             continue
         for a, b in raws:
@@ -419,13 +417,14 @@ class Clf3DDataset(Dataset):
             win[:, :, 0] *= -1
             win[:, :, 3] *= -1
             win[:, :, 6] *= -1
-            # Scalars: swap l/r elbow angles
+            # Swap l/r elbow angles
             win[:, :, [_SC_L_ELBOW, _SC_R_ELBOW]] = win[:, :, [_SC_R_ELBOW, _SC_L_ELBOW]]
-            # Scalars: negate yaw-based features (reflection flips chirality)
-            win[:, :, _SC_HIP_YAW]  *= -1
-            win[:, :, _SC_SH_YAW]   *= -1
-            win[:, :, _SC_XFACTOR]  *= -1
-            # _SC_COM_Z is unsigned — unchanged
+            # Negate yaw-based scalars (reflection flips chirality)
+            win[:, :, _SC_HIP_YAW] *= -1
+            win[:, :, _SC_SH_YAW]  *= -1
+            win[:, :, _SC_XFACTOR] *= -1
+            # com_z is unsigned — unchanged
+            # Label unchanged: lead/rear are merged so mirroring stays in same class
             label = _MIRROR_LABEL_MAP[label]
 
         return torch.from_numpy(win), torch.tensor(label, dtype=torch.long)
@@ -439,24 +438,27 @@ def _extended_val_summary(vt: np.ndarray, vp: np.ndarray) -> str:
     vt  = np.asarray(vt)
     vp  = np.asarray(vp)
     bal = balanced_accuracy_score(vt, vp)
-    f7  = f1_score(vt, vp, average="macro", zero_division=0)
-    f6  = f1_score(vt, vp, average="macro", labels=list(range(6)), zero_division=0)
+    f4  = f1_score(vt, vp, average="macro", zero_division=0)
+    f3  = f1_score(vt, vp, average="macro", labels=[0, 1, 2], zero_division=0)
     pm  = vt != NO_PUNCH_IDX
     acc_on_punch = float((vp[pm] == vt[pm]).mean()) if np.any(pm) else float("nan")
     return (
-        f"val_bal_acc={bal:.3f}  val_macroF1_7cls={f7:.3f}  "
-        f"val_macroF1_6punch={f6:.3f}  val_acc_true_punch={acc_on_punch:.3f}"
+        f"val_bal_acc={bal:.3f}  val_macroF1_4cls={f4:.3f}  "
+        f"val_macroF1_3punch={f3:.3f}  val_acc_true_punch={acc_on_punch:.3f}"
     )
 
 
 def _display_class_name(c: str) -> str:
-    if c == "no_punch":
-        return "No Punch"
-    return c.replace("_", " ").title()
+    return {
+        "jab_punch": "Jab / Punch",
+        "hook":      "Hook",
+        "uppercut":  "Uppercut",
+        "no_punch":  "No Punch",
+    }.get(c, c.replace("_", " ").title())
 
 
 # =============================================================================
-# TTA mirror (permute logits so lead/rear classes align before averaging)
+# TTA mirror (label map is identity for 4 classes, but averaging still helps)
 # =============================================================================
 
 _MIRROR_PERM = torch.tensor(_MIRROR_LABEL_MAP, dtype=torch.long)
@@ -469,7 +471,6 @@ def _tta_mirror_batch(xb: torch.Tensor) -> torch.Tensor:
     flip[:, :, :, 0] *= -1   # pos_x
     flip[:, :, :, 3] *= -1   # vel_x
     flip[:, :, :, 6] *= -1   # acc_x
-    # Swap l/r elbow angles (broadcast scalars are identical across joint dim)
     tmp = flip[:, :, :, _SC_L_ELBOW].clone()
     flip[:, :, :, _SC_L_ELBOW] = flip[:, :, :, _SC_R_ELBOW]
     flip[:, :, :, _SC_R_ELBOW] = tmp
@@ -487,19 +488,21 @@ if not _MOTIONBERT_DIR.is_dir():
     raise SystemExit(f"Missing: {_MOTIONBERT_DIR}")
 if not _ANNOTATION_DIR.is_dir():
     raise SystemExit(f"Missing: {_ANNOTATION_DIR}")
-if not USE_VERSIONS:
-    raise SystemExit("USE_VERSIONS is empty.")
+if not TRAIN_VERSIONS:
+    raise SystemExit("TRAIN_VERSIONS is empty.")
 
-print(f"USE_VERSIONS ({len(USE_VERSIONS)}): {', '.join(sorted(USE_VERSIONS))}")
+print(f"TRAIN_VERSIONS ({len(TRAIN_VERSIONS)}): {', '.join(sorted(TRAIN_VERSIONS))}")
+print(f"TEST_VERSION: {TEST_VERSION}  (held-out, never seen during training)")
 print(f"in_channels={IN_CHANNELS} (pos+vel+acc=9 + {N_SCALARS} broadcast scalars)")
 print(f"scipy SG smoothing: {'enabled' if _HAS_SCIPY else 'DISABLED (install scipy)'}")
+print(f"Classes ({len(CLASSIFIER_CLASSES)}): {CLASSIFIER_CLASSES}")
 print(
-    f"Loading punches (xlsx) + no_punch ({_GAP_REVIEW_JSON.relative_to(_REPO)}) …"
+    f"Loading train/val punches (xlsx) + no_punch ({_GAP_REVIEW_JSON.relative_to(_REPO)}) …"
 )
-all_clips, all_y, used_versions = load_3d_clips_with_negatives()
-print(f"\nLoaded {len(all_y)} clips  device={DEVICE}")
+all_clips, all_y, used_versions = load_3d_clips_with_negatives(TRAIN_VERSIONS)
+print(f"\nLoaded {len(all_y)} train/val clips  device={DEVICE}")
 print(
-    "Class distribution:",
+    "Train/val class distribution:",
     {CLASSIFIER_CLASSES[k]: v for k, v in sorted(Counter(all_y.tolist()).items())},
 )
 
@@ -522,7 +525,7 @@ val_ds   = Clf3DDataset(val_clips,   all_y[idx_val],   window=CLF_WINDOW, augmen
 train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  num_workers=0)
 val_dl   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
-train_counts    = Counter(all_y[idx_train].tolist())
+train_counts = Counter(all_y[idx_train].tolist())
 class_weight_dict = {
     CLASSIFIER_CLASSES[i]: max(train_counts.get(i, 0), 1)
     for i in range(len(CLASSIFIER_CLASSES))
@@ -576,8 +579,7 @@ def eval_epoch(loader):
         flip   = _tta_mirror_batch(xb)
         lo     = model(xb)
         lf_raw = model(flip)
-        # Permute mirrored logits so lead/rear columns align with original classes
-        lf = lf_raw[:, perm]
+        lf     = lf_raw[:, perm]
         logits = (lo + lf) * 0.5
         loss   = crit(logits, yb)
         tot   += loss.item() * yb.size(0)
@@ -652,11 +654,13 @@ for epoch in range(1, EPOCHS + 1):
 
 if best_state is not None:
     model.load_state_dict(best_state)
+
+# ── Validation report (best checkpoint) ─────────────────────────────────────
 _, _, vp, vt, tta_disagree_final, tta_rel_final = eval_epoch(val_dl)
 print(f"\nBest val acc: {best_acc:.3f}")
 print(_extended_val_summary(vt, vp))
 print(
-    "macroF1_6punch: macro-averaged F1 over six punch labels. "
+    "macroF1_3punch: macro-averaged F1 over three punch labels. "
     "acc_true_punch: accuracy restricted to ground-truth punch samples."
 )
 print(
@@ -671,17 +675,44 @@ print(
         zero_division=0,
     )
 )
-print("Confusion matrix:\n", confusion_matrix(vt, vp))
+print("Confusion matrix (val):\n", confusion_matrix(vt, vp))
+
+# ── Held-out test evaluation on V10 ─────────────────────────────────────────
+print(f"\n{'='*60}")
+print(f"Held-out test evaluation: {TEST_VERSION}")
+print(f"{'='*60}")
+test_clips, test_y, _ = load_3d_clips_with_negatives(frozenset([TEST_VERSION]))
+print(
+    f"Test class distribution:",
+    {CLASSIFIER_CLASSES[k]: v for k, v in sorted(Counter(test_y.tolist()).items())},
+)
+test_ds = Clf3DDataset(test_clips, test_y, window=CLF_WINDOW, augment=False)
+test_dl = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+_, test_acc, tp, tt, test_tta_disagree, test_tta_rel = eval_epoch(test_dl)
+print(f"Test acc: {test_acc:.3f}")
+print(_extended_val_summary(tt, tp).replace("val_", "test_"))
+print(
+    f"Test TTA: argmax mismatch rate={test_tta_disagree:.4f}  "
+    f"mean rel ||Δlogit||={test_tta_rel:.4f}"
+)
+print("\nClassification report (test, V10):")
+print(
+    classification_report(
+        tt, tp,
+        target_names=[_display_class_name(c) for c in CLASSIFIER_CLASSES],
+        zero_division=0,
+    )
+)
+print("Confusion matrix (test V10):\n", confusion_matrix(tt, tp))
 
 vers_tag = "_".join(sorted(used_versions))
-ckpt     = _REPO / "checkpoints" / f"punch_transformer_7cls_bio_{vers_tag}.pt"
+ckpt     = _REPO / "checkpoints" / f"punch_transformer_4cls_bio_{vers_tag}.pt"
 ckpt.parent.mkdir(parents=True, exist_ok=True)
 torch.save(
     {
         "model_state":       best_state,
         "model_class":       "PunchTransformer",
         "punch_classes":     CLASSIFIER_CLASSES,
-        "punch_classes_base": PUNCH_CLASSES,
         "no_punch_index":    NO_PUNCH_IDX,
         "label_map":         _LABEL_TO_IDX,
         "window":            CLF_WINDOW,
@@ -704,19 +735,26 @@ torch.save(
         ],
         "negatives": (
             f"gap_review.json (label=no_punch) @ {_GAP_REVIEW_JSON.relative_to(_REPO)}; "
-            f"{NO_PUNCH_SAMPLES_PER_GAP_SPAN} raw windows per span (flush-left/right)"
+            f"{_NO_PUNCH_SAMPLES_PER_GAP_SPAN} raw windows per span (flush-left/right)"
         ),
-        "grad_clip_max_norm": GRAD_CLIP_MAX_NORM,
+        "train_versions":      sorted(TRAIN_VERSIONS),
+        "test_version":        TEST_VERSION,
+        "test_acc":            float(test_acc),
+        "grad_clip_max_norm":  GRAD_CLIP_MAX_NORM,
         "early_stop_patience": EARLY_STOP_PATIENCE,
         "epochs_ran":          epochs_ran,
         "augmentation": (
-            f"jitter±{JITTER_RANGE} + mirror_flip(50%, lead↔rear label swap)"
+            f"jitter±{JITTER_RANGE} + mirror_flip(50%, pose diversity — label unchanged)"
         ),
         "lr_schedule": {
             "warmup_epochs": WARMUP_EPOCHS,
             "warmup":        "LinearLR 0.01→1.0 × base LR",
             "cosine":        f"CosineAnnealingLR T_max={cosine_epochs} eta_min={LR_MIN}",
         },
+        "class_design": (
+            "4-class: jab_punch=(jab+cross), hook=(lead+rear hook), "
+            "uppercut=(lead+rear uppercut), no_punch"
+        ),
     },
     ckpt,
 )

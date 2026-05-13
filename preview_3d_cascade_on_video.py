@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Two-stage cascaded punch classifier preview.
+Writes a composite MP4: RGB (cascade overlay) + side panel with MotionBERT X3D
+skeleton (H36M-17, XY projection, pelvis-centered per frame).
 
 Stage 1 — binary model (punch_transformer_binary_bio_*.pt, 2 classes):
   decides punch vs no_punch for every window.
@@ -303,6 +304,48 @@ def _overlay_banner(
         cv2.putText(frame, line3[:220], (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (180, 180, 180), 1, cv2.LINE_AA)
 
 
+def _make_pose_panel(xyz: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
+    """Draw H36M-17 skeleton from MotionBERT ``X3D[t]`` (17,3) on a BGR canvas (XY view)."""
+    panel = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+    xyz = np.asarray(xyz, dtype=np.float64).reshape(17, 3)
+    xyz = np.nan_to_num(xyz, nan=0.0, posinf=0.0, neginf=0.0)
+    jc = xyz - xyz[0:1]  # pelvis-centered
+    u = jc[:, 0]
+    v = -jc[:, 1]  # image Y downward
+    span = float(max(np.ptp(u), np.ptp(v), 1e-4))
+    pad = span * 0.12
+    u_min, u_max = float(u.min() - pad), float(u.max() + pad)
+    v_min, v_max = float(v.min() - pad), float(v.max() + pad)
+    du = u_max - u_min + 1e-9
+    dv = v_max - v_min + 1e-9
+
+    def to_pt(ui: float, vi: float) -> tuple[int, int]:
+        px = int((ui - u_min) / du * (out_w - 1))
+        py = int((vi - v_min) / dv * (out_h - 1))
+        return int(np.clip(px, 0, out_w - 1)), int(np.clip(py, 0, out_h - 1))
+
+    pts = [to_pt(float(u[i]), float(v[i])) for i in range(17)]
+    col_bone = (72, 200, 72)
+    col_joint = (90, 210, 255)
+    thick = max(2, min(out_h, out_w) // 200 + 1)
+    for a, b in H36M_BONE_PAIRS:
+        cv2.line(panel, pts[a], pts[b], col_bone, thick, cv2.LINE_AA)
+    for i in range(17):
+        cv2.circle(panel, pts[i], max(2, thick), col_joint, -1, cv2.LINE_AA)
+
+    cv2.putText(
+        panel,
+        "MotionBERT X3D (XY, pelvis origin)",
+        (8, 22),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.48,
+        (210, 210, 210),
+        1,
+        cv2.LINE_AA,
+    )
+    return panel
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -330,6 +373,13 @@ def main() -> None:
     ap.add_argument(
         "--slow-motion", type=float, default=1.0, metavar="FACTOR",
         help="Output FPS = source FPS / FACTOR (≥1).",
+    )
+    ap.add_argument(
+        "--pose-panel-width",
+        type=int,
+        default=None,
+        metavar="PX",
+        help="Width of skeleton panel (default: ~38%% of video width, clamped 260–520).",
     )
     ap.add_argument("--out", type=Path, default=None)
     args = ap.parse_args()
@@ -472,9 +522,16 @@ def main() -> None:
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), out_fps, (fw, fh))
+    panel_w = args.pose_panel_width
+    if panel_w is None:
+        panel_w = int(np.clip(round(0.38 * fw), 260, 520))
+    panel_w = max(120, panel_w)
+    out_fw = fw + panel_w
+
+    writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), out_fps, (out_fw, fh))
     if not writer.isOpened():
         raise SystemExit(f"VideoWriter failed: {out_path}")
+    print(f"Output layout: {fw}x{fh} video + {panel_w}x{fh} pose panel → {out_fw}x{fh}")
 
     cap = cv2.VideoCapture(str(video_path))
     cap.set(cv2.CAP_PROP_POS_FRAMES, float(start_i))
@@ -503,7 +560,11 @@ def main() -> None:
                 + (f"  slow={sm:g}x" if sm > 1.0 else "")
             )
             _overlay_banner(frame, line1, line2, line3)
-            writer.write(frame)
+            ti = min(t, raw.shape[0] - 1)
+            pose_panel = _make_pose_panel(raw[ti], fh, panel_w)
+            combo = np.hstack([frame, pose_panel])
+            combo[:, fw - 1 : fw + 1] = (55, 55, 55)
+            writer.write(combo)
     finally:
         writer.release()
         cap.release()

@@ -6,10 +6,19 @@ Loads ``Dataset/Annotation_files/{VER}.xlsx``, finds the matching RGB MP4, then
 plays each annotated segment with the label overlaid. Default playback is slower
 than realtime so you can judge timing and labels.
 
-**Frames vs Excel (BoxIV-style convention, same as ``train.ipynb`` / preprocess):**
-spreadsheet ``start`` and ``end`` are **1-based inclusive** indices into the
-decoded MP4 (frame ``1`` = first frame). Internally we use 0-based ``i0..i1``
-inclusive.
+**Frames vs Excel (BoxingVI / BoxIV-style convention, same as ``preprocess`` / training):**
+spreadsheet ``start`` and ``end`` are **1-based inclusive** frame indices into
+the **same** MP4 you open here (frame ``1`` = first decoded frame). Internally
+this script uses 0-based **inclusive** ``i0..i1`` matching training’s half-open
+slice ``frames[s0:e0)`` with ``s0=start-1``, ``e0=end`` (``end`` = last 1-based
+frame index, same integer as in the sheet).
+
+**If labels look shifted in time:** the spreadsheet is usually aligned to the
+player or toolchain used during BoxingVI labelling, not necessarily to OpenCV’s
+decoder. Try ``--frame-offset N`` (shifts both ends by ``N`` OpenCV frames).
+Compare ``CAP_PROP_FRAME_COUNT`` vs ``Dataset/MotionBERT_3d/{ver}/X3D.npy`` length
+printed at startup — if they differ, 3D training rows may not line up with this
+RGB decode either.
 
 **Alignment:** ``cv2.VideoCapture.set(CAP_PROP_POS_FRAMES)`` is unreliable on
 many H.264/MP4 files (keyframe snapping). By default this script **decodes
@@ -35,6 +44,7 @@ import sys
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 _REPO = Path(__file__).resolve().parent
 
@@ -111,6 +121,16 @@ def main() -> None:
             "Default: sequential decode so 1-based Excel frames match the video."
         ),
     )
+    ap.add_argument(
+        "--frame-offset",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Add N to both 0-based decode indices after Excel conversion (negative allowed). "
+            "Use when labels look consistently early/late vs the RGB (different decoder / export)."
+        ),
+    )
     args = ap.parse_args()
 
     ver = _normalize_ver(args.ver)
@@ -166,16 +186,45 @@ def main() -> None:
 
     cap = cv2.VideoCapture(str(video_path))
     fps = float(cap.get(cv2.CAP_PROP_FPS) or 24.0)
+    n_vid = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    x3d_path = _REPO / "Dataset" / "MotionBERT_3d" / ver / "X3D.npy"
+    n_x3d: int | None = None
+    if x3d_path.is_file():
+        n_x3d = int(np.load(x3d_path, mmap_mode="r").shape[0])
+        print(
+            f"frame counts: OpenCV CAP_PROP_FRAME_COUNT={n_vid}  "
+            f"MotionBERT X3D.npy T={n_x3d}  ({x3d_path.relative_to(_REPO)})",
+            file=sys.stderr,
+        )
+        if n_vid > 0 and n_x3d > 0 and n_vid != n_x3d:
+            print(
+                "warning: RGB frame count ≠ X3D length — annotations may match one stream "
+                "better than the other; try --frame-offset if RGB looks shifted vs labels.",
+                file=sys.stderr,
+            )
+    else:
+        print(f"frame counts: OpenCV CAP_PROP_FRAME_COUNT={n_vid}  (no X3D.npy)", file=sys.stderr)
+    if args.frame_offset != 0:
+        print(f"--frame-offset={args.frame_offset} (applied after 1-based→0-based)", file=sys.stderr)
+
     delay_ms = max(1, int(1000.0 / fps / args.speed))
     decoder_next = 0
 
     try:
         for idx, (s1, e1, label) in enumerate(rows, 1):
             i0, i1 = int(s1) - 1, int(e1) - 1
+            i0 += args.frame_offset
+            i1 += args.frame_offset
+            if n_vid > 0:
+                i0 = max(0, min(n_vid - 1, i0))
+                i1 = max(0, min(n_vid - 1, i1))
+            if i1 < i0:
+                print(f"  skip clip {idx}: empty range after offset/clamp", file=sys.stderr)
+                continue
             t0, t1 = i0 / fps, i1 / fps
             tag = (
                 f"[{idx}/{total}] {ver} | {label} | Excel frames {s1}–{e1} (1-based) "
-                f"| decode {i0}–{i1} (0-based) | {t0:.2f}s–{t1:.2f}s"
+                f"| decode {i0}–{i1} (0-based, after offset) | {t0:.2f}s–{t1:.2f}s"
             )
             print(tag, file=sys.stderr)
 
