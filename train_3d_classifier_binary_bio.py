@@ -40,7 +40,7 @@ _REPO             = Path.cwd().resolve()
 _MOTIONBERT_DIR   = _REPO / "Dataset" / "MotionBERT_3d"
 _ANNOTATION_DIR   = _REPO / "Dataset" / "Annotation_files"
 
-USE_VERSIONS: frozenset[str] = frozenset(f"V{i}" for i in range(1, 11))
+USE_VERSIONS: frozenset[str] = frozenset(f"V{i}" for i in range(2, 11))
 
 CLF_WINDOW  = 16
 JITTER_RANGE = 2
@@ -280,7 +280,12 @@ def _no_punch_clips_from_gaps(
 # Data loading
 # =============================================================================
 
-def load_binary_clips() -> tuple[list[np.ndarray], np.ndarray, list[str]]:
+def load_binary_clips(
+    *,
+    versions: frozenset[str] | None = None,
+) -> tuple[list[np.ndarray], np.ndarray, list[str]]:
+    """Load punch + gap-sampled no_punch clips. ``versions=None`` → ``USE_VERSIONS``."""
+    use     = USE_VERSIONS if versions is None else versions
     clips:  list[np.ndarray] = []
     y_list: list[int]        = []
     n_punch = 0
@@ -291,7 +296,7 @@ def load_binary_clips() -> tuple[list[np.ndarray], np.ndarray, list[str]]:
         if not ver_dir.is_dir():
             continue
         ver = ver_dir.name.upper()
-        if ver not in USE_VERSIONS:
+        if ver not in use:
             continue
         npy_path = ver_dir / "X3D.npy"
         if not npy_path.exists():
@@ -433,84 +438,12 @@ def _tta_mirror_batch(xb: torch.Tensor) -> torch.Tensor:
 
 
 # =============================================================================
-# Training
+# Training loop helpers
 # =============================================================================
-
-if not _MOTIONBERT_DIR.is_dir():
-    raise SystemExit(f"Missing: {_MOTIONBERT_DIR}")
-if not _ANNOTATION_DIR.is_dir():
-    raise SystemExit(f"Missing: {_ANNOTATION_DIR}")
-
-print(f"USE_VERSIONS ({len(USE_VERSIONS)}): {', '.join(sorted(USE_VERSIONS))}")
-print(f"in_channels={IN_CHANNELS}  binary: punch vs no_punch")
-print(f"scipy SG smoothing: {'enabled' if _HAS_SCIPY else 'DISABLED (install scipy)'}")
-print(f"No-punch from gaps  buffer={PUNCH_BOUNDARY_BUFFER}f  max_per_gap={NO_PUNCH_SAMPLES_PER_GAP}")
-print("Loading clips …")
-
-all_clips, all_y, used_versions = load_binary_clips()
-print(f"\nLoaded {len(all_y)} clips  device={DEVICE}")
-print("Class distribution:", {CLASSIFIER_CLASSES[k]: v for k, v in sorted(Counter(all_y.tolist()).items())})
-
-uniq, counts = np.unique(all_y, return_counts=True)
-can_stratify  = bool(np.all(counts >= 2))
-
-idx_train, idx_val = train_test_split(
-    np.arange(len(all_y)),
-    test_size=VAL_FRAC,
-    random_state=SEED,
-    stratify=all_y if can_stratify else None,
-)
-
-train_clips = [all_clips[i] for i in idx_train]
-val_clips   = [all_clips[i] for i in idx_val]
-
-train_ds = BinaryClipDataset(train_clips, all_y[idx_train], window=CLF_WINDOW, augment=True)
-val_ds   = BinaryClipDataset(val_clips,   all_y[idx_val],   window=CLF_WINDOW, augment=False)
-
-train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  num_workers=0)
-val_dl   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
-
-train_counts = Counter(all_y[idx_train].tolist())
-class_weight_dict = {
-    CLASSIFIER_CLASSES[i]: max(train_counts.get(i, 0), 1)
-    for i in range(len(CLASSIFIER_CLASSES))
-}
-class_weights = make_class_weights(class_weight_dict, classes=CLASSIFIER_CLASSES, device=DEVICE)
-print(
-    "Class weights:",
-    {CLASSIFIER_CLASSES[k]: f"{v:.3f}" for k, v in sorted(
-        enumerate(class_weights.tolist()), key=lambda x: x[0])},
-)
-crit = torch.nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.05)
-
-model = PunchTransformer(
-    num_classes=len(CLASSIFIER_CLASSES),
-    in_channels=IN_CHANNELS,
-    edges=H36M_BONE_PAIRS,
-    spatial_hidden=MODEL_SPATIAL_HIDDEN,
-    d_model=MODEL_D_MODEL,
-    nhead=MODEL_NHEAD,
-    num_layers=MODEL_NUM_LAYERS,
-    dim_feedforward=MODEL_DIM_FEEDFORWARD,
-    dropout=MODEL_DROPOUT,
-).to(DEVICE)
-
-print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-
-opt           = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
-cosine_epochs = max(1, EPOCHS - WARMUP_EPOCHS)
-sched         = SequentialLR(
-    opt,
-    schedulers=[
-        LinearLR(opt, start_factor=0.01, end_factor=1.0, total_iters=min(WARMUP_EPOCHS, EPOCHS)),
-        CosineAnnealingLR(opt, T_max=cosine_epochs, eta_min=LR_MIN),
-    ],
-    milestones=[min(WARMUP_EPOCHS, EPOCHS)],
-)
 
 
 @torch.no_grad()
-def eval_epoch(loader):
+def eval_epoch(loader, model, crit):
     model.eval()
     tot, correct, n = 0.0, 0, 0
     all_p, all_t   = [], []
@@ -549,102 +482,179 @@ def eval_epoch(loader):
     )
 
 
-best_acc    = 0.0
-best_state  = None
-patience_ctr = 0
-epochs_ran  = 0
+def main() -> None:
+    if not _MOTIONBERT_DIR.is_dir():
+        raise SystemExit(f"Missing: {_MOTIONBERT_DIR}")
+    if not _ANNOTATION_DIR.is_dir():
+        raise SystemExit(f"Missing: {_ANNOTATION_DIR}")
 
-for epoch in range(1, EPOCHS + 1):
-    epochs_ran = epoch
-    model.train()
-    run_loss, run_ok, run_n = 0.0, 0, 0
-    for xb, yb in train_dl:
-        xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-        opt.zero_grad(set_to_none=True)
-        logits = model(xb)
-        loss   = crit(logits, yb)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_MAX_NORM)
-        opt.step()
-        run_loss += loss.item() * yb.size(0)
-        run_ok   += (logits.argmax(1) == yb).sum().item()
-        run_n    += yb.size(0)
-    sched.step()
-    lr_now = opt.param_groups[0]["lr"]
+    print(f"USE_VERSIONS ({len(USE_VERSIONS)}): {', '.join(sorted(USE_VERSIONS))}")
+    print(f"in_channels={IN_CHANNELS}  binary: punch vs no_punch")
+    print(f"scipy SG smoothing: {'enabled' if _HAS_SCIPY else 'DISABLED (install scipy)'}")
+    print(f"No-punch from gaps  buffer={PUNCH_BOUNDARY_BUFFER}f  max_per_gap={NO_PUNCH_SAMPLES_PER_GAP}")
+    print("Loading clips …")
 
-    va_loss, va_acc, vp, vt, tta_disagree, tta_rel = eval_epoch(val_dl)
-    if va_acc > best_acc:
-        best_acc   = va_acc
-        best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-        patience_ctr = 0
-    else:
-        patience_ctr += 1
+    all_clips, all_y, used_versions = load_binary_clips()
+    print(f"\nLoaded {len(all_y)} clips  device={DEVICE}")
+    print("Class distribution:", {CLASSIFIER_CLASSES[k]: v for k, v in sorted(Counter(all_y.tolist()).items())})
 
-    print(
-        f"epoch {epoch:02d}/{EPOCHS}  lr {lr_now:.2e}  "
-        f"train loss {run_loss / max(run_n, 1):.4f} acc {run_ok / max(run_n, 1):.3f}  "
-        f"val loss {va_loss:.4f} acc {va_acc:.3f}  "
-        f"tta_mismatch={tta_disagree:.3f}  tta_rel={tta_rel:.4f}\n"
-        f"         {_val_summary(vt, vp)}  "
-        f"no_improve={patience_ctr}/{EARLY_STOP_PATIENCE}"
+    uniq, counts = np.unique(all_y, return_counts=True)
+    can_stratify  = bool(np.all(counts >= 2))
+
+    idx_train, idx_val = train_test_split(
+        np.arange(len(all_y)),
+        test_size=VAL_FRAC,
+        random_state=SEED,
+        stratify=all_y if can_stratify else None,
     )
 
-    if patience_ctr >= EARLY_STOP_PATIENCE:
+    train_clips = [all_clips[i] for i in idx_train]
+    val_clips   = [all_clips[i] for i in idx_val]
+
+    train_ds = BinaryClipDataset(train_clips, all_y[idx_train], window=CLF_WINDOW, augment=True)
+    val_ds   = BinaryClipDataset(val_clips,   all_y[idx_val],   window=CLF_WINDOW, augment=False)
+
+    train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  num_workers=0)
+    val_dl   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+
+    train_counts = Counter(all_y[idx_train].tolist())
+    class_weight_dict = {
+        CLASSIFIER_CLASSES[i]: max(train_counts.get(i, 0), 1)
+        for i in range(len(CLASSIFIER_CLASSES))
+    }
+    class_weights = make_class_weights(class_weight_dict, classes=CLASSIFIER_CLASSES, device=DEVICE)
+    print(
+        "Class weights:",
+        {CLASSIFIER_CLASSES[k]: f"{v:.3f}" for k, v in sorted(
+            enumerate(class_weights.tolist()), key=lambda x: x[0])},
+    )
+    crit = torch.nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.05)
+
+    model = PunchTransformer(
+        num_classes=len(CLASSIFIER_CLASSES),
+        in_channels=IN_CHANNELS,
+        edges=H36M_BONE_PAIRS,
+        spatial_hidden=MODEL_SPATIAL_HIDDEN,
+        d_model=MODEL_D_MODEL,
+        nhead=MODEL_NHEAD,
+        num_layers=MODEL_NUM_LAYERS,
+        dim_feedforward=MODEL_DIM_FEEDFORWARD,
+        dropout=MODEL_DROPOUT,
+    ).to(DEVICE)
+
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    opt           = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
+    cosine_epochs = max(1, EPOCHS - WARMUP_EPOCHS)
+    sched         = SequentialLR(
+        opt,
+        schedulers=[
+            LinearLR(opt, start_factor=0.01, end_factor=1.0, total_iters=min(WARMUP_EPOCHS, EPOCHS)),
+            CosineAnnealingLR(opt, T_max=cosine_epochs, eta_min=LR_MIN),
+        ],
+        milestones=[min(WARMUP_EPOCHS, EPOCHS)],
+    )
+
+    best_acc    = 0.0
+    best_state  = None
+    patience_ctr = 0
+    epochs_ran  = 0
+
+    for epoch in range(1, EPOCHS + 1):
+        epochs_ran = epoch
+        model.train()
+        run_loss, run_ok, run_n = 0.0, 0, 0
+        for xb, yb in train_dl:
+            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+            opt.zero_grad(set_to_none=True)
+            logits = model(xb)
+            loss   = crit(logits, yb)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_MAX_NORM)
+            opt.step()
+            run_loss += loss.item() * yb.size(0)
+            run_ok   += (logits.argmax(1) == yb).sum().item()
+            run_n    += yb.size(0)
+        sched.step()
+        lr_now = opt.param_groups[0]["lr"]
+
+        va_loss, va_acc, vp, vt, tta_disagree, tta_rel = eval_epoch(val_dl, model, crit)
+        if va_acc > best_acc:
+            best_acc   = va_acc
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            patience_ctr = 0
+        else:
+            patience_ctr += 1
+
         print(
-            f"\nEarly stop: val acc did not improve for {EARLY_STOP_PATIENCE} epochs "
-            f"(best={best_acc:.3f})."
+            f"epoch {epoch:02d}/{EPOCHS}  lr {lr_now:.2e}  "
+            f"train loss {run_loss / max(run_n, 1):.4f} acc {run_ok / max(run_n, 1):.3f}  "
+            f"val loss {va_loss:.4f} acc {va_acc:.3f}  "
+            f"tta_mismatch={tta_disagree:.3f}  tta_rel={tta_rel:.4f}\n"
+            f"         {_val_summary(vt, vp)}  "
+            f"no_improve={patience_ctr}/{EARLY_STOP_PATIENCE}"
         )
-        break
 
-if best_state is not None:
-    model.load_state_dict(best_state)
-_, _, vp, vt, tta_disagree_final, tta_rel_final = eval_epoch(val_dl)
-print(f"\nBest val acc: {best_acc:.3f}")
-print(_val_summary(vt, vp))
-print(f"Val TTA (best): argmax mismatch={tta_disagree_final:.4f}  mean rel ||Δlogit||={tta_rel_final:.4f}")
-print("\nClassification report (val, best checkpoint):")
-print(classification_report(vt, vp, target_names=["Punch", "No Punch"], zero_division=0))
-print("Confusion matrix:\n", confusion_matrix(vt, vp))
+        if patience_ctr >= EARLY_STOP_PATIENCE:
+            print(
+                f"\nEarly stop: val acc did not improve for {EARLY_STOP_PATIENCE} epochs "
+                f"(best={best_acc:.3f})."
+            )
+            break
 
-vers_tag = "_".join(sorted(used_versions))
-ckpt     = _REPO / "checkpoints" / f"punch_transformer_binary_bio_{vers_tag}.pt"
-ckpt.parent.mkdir(parents=True, exist_ok=True)
-torch.save(
-    {
-        "model_state":        best_state,
-        "model_class":        "PunchTransformer",
-        "punch_classes":      CLASSIFIER_CLASSES,
-        "punch_idx":          PUNCH_IDX,
-        "no_punch_idx":       NO_PUNCH_IDX,
-        "window":             CLF_WINDOW,
-        "in_channels":        IN_CHANNELS,
-        "spatial_hidden":     MODEL_SPATIAL_HIDDEN,
-        "d_model":            MODEL_D_MODEL,
-        "nhead":              MODEL_NHEAD,
-        "num_layers":         MODEL_NUM_LAYERS,
-        "dim_feedforward":    MODEL_DIM_FEEDFORWARD,
-        "dropout":            MODEL_DROPOUT,
-        "skeleton":           "H36M-17",
-        "source":             "MotionBERT_3d",
-        "preprocessing": (
-            f"body_frame + torso_scale + SG_smooth(w=5,p=2) + "
-            f"pos(3)+vel(3)+acc(3)+scalars({N_SCALARS} broadcast)"
-        ),
-        "scalar_features":    ["l_elbow_angle", "r_elbow_angle", "hip_yaw", "shoulder_yaw", "xfactor", "com_z"],
-        "negatives": (
-            f"between-annotation gaps  buffer={PUNCH_BOUNDARY_BUFFER}f  "
-            f"max_per_gap={NO_PUNCH_SAMPLES_PER_GAP}"
-        ),
-        "grad_clip_max_norm": GRAD_CLIP_MAX_NORM,
-        "early_stop_patience": EARLY_STOP_PATIENCE,
-        "epochs_ran":         epochs_ran,
-        "augmentation":       f"jitter±{JITTER_RANGE} + mirror_flip(50%)",
-        "lr_schedule": {
-            "warmup_epochs": WARMUP_EPOCHS,
-            "warmup":        "LinearLR 0.01→1.0 × base LR",
-            "cosine":        f"CosineAnnealingLR T_max={cosine_epochs} eta_min={LR_MIN}",
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    _, _, vp, vt, tta_disagree_final, tta_rel_final = eval_epoch(val_dl, model, crit)
+    print(f"\nBest val acc: {best_acc:.3f}")
+    print(_val_summary(vt, vp))
+    print(f"Val TTA (best): argmax mismatch={tta_disagree_final:.4f}  mean rel ||Δlogit||={tta_rel_final:.4f}")
+    print("\nClassification report (val, best checkpoint):")
+    print(classification_report(vt, vp, target_names=["Punch", "No Punch"], zero_division=0))
+    print("Confusion matrix:\n", confusion_matrix(vt, vp))
+
+    vers_tag = "_".join(sorted(used_versions))
+    ckpt     = _REPO / "checkpoints" / f"punch_transformer_binary_bio_{vers_tag}.pt"
+    ckpt.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "model_state":        best_state,
+            "model_class":        "PunchTransformer",
+            "punch_classes":      CLASSIFIER_CLASSES,
+            "punch_idx":          PUNCH_IDX,
+            "no_punch_idx":       NO_PUNCH_IDX,
+            "window":             CLF_WINDOW,
+            "in_channels":        IN_CHANNELS,
+            "spatial_hidden":     MODEL_SPATIAL_HIDDEN,
+            "d_model":            MODEL_D_MODEL,
+            "nhead":              MODEL_NHEAD,
+            "num_layers":         MODEL_NUM_LAYERS,
+            "dim_feedforward":    MODEL_DIM_FEEDFORWARD,
+            "dropout":            MODEL_DROPOUT,
+            "skeleton":           "H36M-17",
+            "source":             "MotionBERT_3d",
+            "preprocessing": (
+                f"body_frame + torso_scale + SG_smooth(w=5,p=2) + "
+                f"pos(3)+vel(3)+acc(3)+scalars({N_SCALARS} broadcast)"
+            ),
+            "scalar_features":    ["l_elbow_angle", "r_elbow_angle", "hip_yaw", "shoulder_yaw", "xfactor", "com_z"],
+            "negatives": (
+                f"between-annotation gaps  buffer={PUNCH_BOUNDARY_BUFFER}f  "
+                f"max_per_gap={NO_PUNCH_SAMPLES_PER_GAP}"
+            ),
+            "grad_clip_max_norm": GRAD_CLIP_MAX_NORM,
+            "early_stop_patience": EARLY_STOP_PATIENCE,
+            "epochs_ran":         epochs_ran,
+            "augmentation":       f"jitter±{JITTER_RANGE} + mirror_flip(50%)",
+            "lr_schedule": {
+                "warmup_epochs": WARMUP_EPOCHS,
+                "warmup":        "LinearLR 0.01→1.0 × base LR",
+                "cosine":        f"CosineAnnealingLR T_max={cosine_epochs} eta_min={LR_MIN}",
+            },
         },
-    },
-    ckpt,
-)
-print(f"Checkpoint → {ckpt.relative_to(_REPO)}")
+        ckpt,
+    )
+    print(f"Checkpoint → {ckpt.relative_to(_REPO)}")
+
+
+if __name__ == "__main__":
+    main()

@@ -53,7 +53,7 @@ _MOTIONBERT_DIR = _REPO / "Dataset" / "MotionBERT_3d"
 _ANNOTATION_DIR = _REPO / "Dataset" / "Annotation_files"
 _GAP_REVIEW_JSON = _REPO / "Dataset" / "gap_labels" / "gap_review.json"
 
-TRAIN_VERSIONS: frozenset[str] = frozenset(f"V{i}" for i in range(5, 11))
+TRAIN_VERSIONS: frozenset[str] = frozenset(f"V{i}" for i in range(4, 11))
 
 CLF_WINDOW = 16
 JITTER_RANGE = 2
@@ -92,15 +92,21 @@ _J_R_ELBOW    = 15
 _J_R_WRIST    = 16
 
 # ── Feature layout ───────────────────────────────────────────────────────────
-N_SCALARS   = 6
-IN_CHANNELS = 9 + N_SCALARS  # 15 total
+N_SCALARS   = 10
+IN_CHANNELS = 9 + N_SCALARS  # 19 total
 
+# Original 6 scalars
 _SC_L_ELBOW = 9
 _SC_R_ELBOW = 10
 _SC_HIP_YAW = 11
 _SC_SH_YAW  = 12
 _SC_XFACTOR = 13
 _SC_COM_Z   = 14
+# 4 new ANOVA-motivated scalars
+_SC_L_LAT   = 15   # normalised lateral vel direction of L wrist: v_x_L / |vel_L|
+_SC_R_LAT   = 16   # normalised lateral vel direction of R wrist: v_x_R / |vel_R|
+_SC_BILAT   = 17   # bilateral speed asymmetry: (sp_R - sp_L) / (sp_R + sp_L)
+_SC_SH_AVEL = 18   # shoulder angular velocity: d(shoulder_yaw)/dt
 
 # Map all 6 raw punch labels to the 3 merged punch classes
 _LABEL_TO_IDX: dict[str, int] = {
@@ -175,17 +181,21 @@ def _angle3(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> np.ndarray:
 
 def _preprocess_clip(clip: np.ndarray) -> np.ndarray:
     """
-    (T, 17, 3) → (T, 17, 15) float32.
+    (T, 17, 3) → (T, 17, 19) float32.
     Channel layout per joint:
-      0–2   pos  (body frame, torso-normalised)
-      3–5   vel  (central finite diff on smoothed pos)
-      6–8   acc  (central finite diff on vel)
-      9     l_elbow_angle  (broadcast scalar)
-      10    r_elbow_angle  (broadcast scalar)
-      11    hip_yaw        (broadcast scalar)
-      12    shoulder_yaw   (broadcast scalar)
-      13    xfactor = shoulder_yaw − hip_yaw  (broadcast scalar)
-      14    com_z          (broadcast scalar)
+      0–2   pos          (body frame, torso-normalised)
+      3–5   vel          (central finite diff on smoothed pos)
+      6–8   acc          (central finite diff on vel)
+      9     l_elbow_angle       (broadcast scalar)
+      10    r_elbow_angle       (broadcast scalar)
+      11    hip_yaw             (broadcast scalar)
+      12    shoulder_yaw        (broadcast scalar)
+      13    xfactor             (broadcast scalar)
+      14    com_z               (broadcast scalar)
+      15    l_wrist_lat_vel     v_x_L / |vel_L|  — normalised lateral direction
+      16    r_wrist_lat_vel     v_x_R / |vel_R|  — normalised lateral direction
+      17    bilateral_asymmetry (sp_R − sp_L) / (sp_R + sp_L)
+      18    shoulder_ang_vel    d(shoulder_yaw)/dt
     """
     q = _to_body_frame(clip.astype(np.float64))
     q = _scale_normalize(q)
@@ -209,9 +219,27 @@ def _preprocess_clip(clip: np.ndarray) -> np.ndarray:
     xfactor      = shoulder_yaw - hip_yaw
     com_z        = q_sm[:, :, 2].mean(axis=1)
 
+    # ── 4 ANOVA-motivated scalars ──────────────────────────────────────────
+    vel_L = vel[:, _J_L_WRIST, :]                              # (T, 3)
+    vel_R = vel[:, _J_R_WRIST, :]
+    sp_L  = np.linalg.norm(vel_L, axis=-1) + 1e-8             # (T,)
+    sp_R  = np.linalg.norm(vel_R, axis=-1) + 1e-8
+    # Normalised lateral direction: +1 = pure rightward, −1 = pure leftward
+    l_lat = vel_L[:, 0] / sp_L
+    r_lat = vel_R[:, 0] / sp_R
+    # Bilateral asymmetry: +1 = right hand punching, −1 = left hand punching
+    bilat = (sp_R - sp_L) / (sp_R + sp_L)
+    # Shoulder angular velocity (rad/frame) — high for cross/hook, low for jab
+    if T < 2:
+        sh_ang_vel = np.zeros(T, dtype=np.float64)
+    else:
+        sh_ang_vel = np.gradient(shoulder_yaw)
+
     scalars = np.stack(
-        [l_elbow, r_elbow, hip_yaw, shoulder_yaw, xfactor, com_z], axis=-1
-    )  # (T, 6)
+        [l_elbow, r_elbow, hip_yaw, shoulder_yaw, xfactor, com_z,
+         l_lat, r_lat, bilat, sh_ang_vel],
+        axis=-1,
+    )  # (T, 10)
     scalars_bc = np.broadcast_to(
         scalars[:, np.newaxis, :], (T, 17, N_SCALARS)
     ).copy()
@@ -435,11 +463,17 @@ class Clf3DDataset(Dataset):
             # Swap l/r elbow angles
             win[:, :, [_SC_L_ELBOW, _SC_R_ELBOW]] = win[:, :, [_SC_R_ELBOW, _SC_L_ELBOW]]
             # Negate yaw-based scalars (reflection flips chirality)
-            win[:, :, _SC_HIP_YAW] *= -1
-            win[:, :, _SC_SH_YAW]  *= -1
-            win[:, :, _SC_XFACTOR] *= -1
-            # com_z is unsigned — unchanged
-            # Label unchanged: lead/rear are merged so mirroring stays in same class
+            win[:, :, _SC_HIP_YAW]  *= -1
+            win[:, :, _SC_SH_YAW]   *= -1
+            win[:, :, _SC_XFACTOR]  *= -1
+            # com_z unsigned — unchanged
+            # New scalars: swap L/R lateral vel dirs (and negate — x flips sign)
+            tmp = win[:, :, _SC_L_LAT].copy()
+            win[:, :, _SC_L_LAT]  = -win[:, :, _SC_R_LAT]
+            win[:, :, _SC_R_LAT]  = -tmp
+            win[:, :, _SC_BILAT]  *= -1   # (sp_R−sp_L) becomes (sp_L−sp_R)
+            win[:, :, _SC_SH_AVEL] *= -1  # shoulder rotation reverses chirality
+            # Label unchanged: lead/rear merged, mirroring stays in same class
             label = _MIRROR_LABEL_MAP[label]
 
         return torch.from_numpy(win), torch.tensor(label, dtype=torch.long)
@@ -489,9 +523,14 @@ def _tta_mirror_batch(xb: torch.Tensor) -> torch.Tensor:
     tmp = flip[:, :, :, _SC_L_ELBOW].clone()
     flip[:, :, :, _SC_L_ELBOW] = flip[:, :, :, _SC_R_ELBOW]
     flip[:, :, :, _SC_R_ELBOW] = tmp
-    flip[:, :, :, _SC_HIP_YAW] *= -1
-    flip[:, :, :, _SC_SH_YAW]  *= -1
-    flip[:, :, :, _SC_XFACTOR] *= -1
+    flip[:, :, :, _SC_HIP_YAW]  *= -1
+    flip[:, :, :, _SC_SH_YAW]   *= -1
+    flip[:, :, :, _SC_XFACTOR]  *= -1
+    tmp = flip[:, :, :, _SC_L_LAT].clone()
+    flip[:, :, :, _SC_L_LAT]   = -flip[:, :, :, _SC_R_LAT]
+    flip[:, :, :, _SC_R_LAT]   = -tmp
+    flip[:, :, :, _SC_BILAT]   *= -1
+    flip[:, :, :, _SC_SH_AVEL] *= -1
     return flip
 
 
@@ -507,7 +546,8 @@ if not TRAIN_VERSIONS:
     raise SystemExit("TRAIN_VERSIONS is empty.")
 
 print(f"TRAIN_VERSIONS ({len(TRAIN_VERSIONS)}): {', '.join(sorted(TRAIN_VERSIONS))}")
-print(f"in_channels={IN_CHANNELS} (pos+vel+acc=9 + {N_SCALARS} broadcast scalars)")
+print(f"in_channels={IN_CHANNELS} (pos+vel+acc=9 + {N_SCALARS} broadcast scalars: "
+      f"elbow×2, hip_yaw, sh_yaw, xfactor, com_z, lat_vel×2, bilat_asym, sh_ang_vel)")
 print(f"scipy SG smoothing: {'enabled' if _HAS_SCIPY else 'DISABLED (install scipy)'}")
 print(f"Classes ({len(CLASSIFIER_CLASSES)}): {CLASSIFIER_CLASSES}")
 print(
@@ -718,6 +758,8 @@ torch.save(
         "scalar_features": [
             "l_elbow_angle", "r_elbow_angle",
             "hip_yaw", "shoulder_yaw", "xfactor", "com_z",
+            "l_wrist_lat_vel_norm", "r_wrist_lat_vel_norm",
+            "bilateral_asymmetry", "shoulder_ang_vel",
         ],
         "negatives": (
             f"gap_review.json (label=no_punch) @ {_GAP_REVIEW_JSON.relative_to(_REPO)}; "
