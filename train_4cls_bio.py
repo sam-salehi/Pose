@@ -54,7 +54,6 @@ _ANNOTATION_DIR = _REPO / "Dataset" / "Annotation_files"
 _GAP_REVIEW_JSON = _REPO / "Dataset" / "gap_labels" / "gap_review.json"
 
 TRAIN_VERSIONS: frozenset[str] = frozenset(f"V{i}" for i in range(5, 11))
-TEST_VERSION:   str             = "V4"
 
 CLF_WINDOW = 16
 JITTER_RANGE = 2
@@ -405,11 +404,27 @@ class Clf3DDataset(Dataset):
         clip  = self.clips[i]
         label = int(self.y[i])
 
-        jitter = (
-            int(np.random.randint(-JITTER_RANGE, JITTER_RANGE + 1))
-            if self.augment else 0
-        )
-        win = _prepare_window_3d(clip, self.window, jitter=jitter)
+        T_clip = clip.shape[0]
+        if self.augment:
+            if T_clip < self.window:
+                # Randomly place the punch anywhere within the window so the model
+                # sees it at all temporal positions, matching inference sliding-window.
+                max_offset = self.window - T_clip
+                offset = int(np.random.randint(0, max_offset + 1))
+                pad_pre  = offset
+                pad_post = self.window - T_clip - offset
+                win = np.concatenate([
+                    np.tile(clip[[0]], (pad_pre, 1, 1)),
+                    clip,
+                    np.tile(clip[[-1]], (pad_post, 1, 1)),
+                ], axis=0)
+            else:
+                # Clip longer than window: jitter the center crop as before
+                jitter = int(np.random.randint(-JITTER_RANGE, JITTER_RANGE + 1))
+                win = _prepare_window_3d(clip, self.window, jitter=jitter)
+        else:
+            # Val/test: center the clip consistently
+            win = _prepare_window_3d(clip, self.window, jitter=0)
 
         if self.augment and np.random.random() < 0.5:
             win = win[:, _FLIP_JOINT_ORDER, :].copy()
@@ -492,7 +507,6 @@ if not TRAIN_VERSIONS:
     raise SystemExit("TRAIN_VERSIONS is empty.")
 
 print(f"TRAIN_VERSIONS ({len(TRAIN_VERSIONS)}): {', '.join(sorted(TRAIN_VERSIONS))}")
-print(f"TEST_VERSION: {TEST_VERSION}  (held-out, never seen during training)")
 print(f"in_channels={IN_CHANNELS} (pos+vel+acc=9 + {N_SCALARS} broadcast scalars)")
 print(f"scipy SG smoothing: {'enabled' if _HAS_SCIPY else 'DISABLED (install scipy)'}")
 print(f"Classes ({len(CLASSIFIER_CLASSES)}): {CLASSIFIER_CLASSES}")
@@ -677,34 +691,6 @@ print(
 )
 print("Confusion matrix (val):\n", confusion_matrix(vt, vp))
 
-# ── Held-out test evaluation on V10 ─────────────────────────────────────────
-print(f"\n{'='*60}")
-print(f"Held-out test evaluation: {TEST_VERSION}")
-print(f"{'='*60}")
-test_clips, test_y, _ = load_3d_clips_with_negatives(frozenset([TEST_VERSION]))
-print(
-    f"Test class distribution:",
-    {CLASSIFIER_CLASSES[k]: v for k, v in sorted(Counter(test_y.tolist()).items())},
-)
-test_ds = Clf3DDataset(test_clips, test_y, window=CLF_WINDOW, augment=False)
-test_dl = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
-_, test_acc, tp, tt, test_tta_disagree, test_tta_rel = eval_epoch(test_dl)
-print(f"Test acc: {test_acc:.3f}")
-print(_extended_val_summary(tt, tp).replace("val_", "test_"))
-print(
-    f"Test TTA: argmax mismatch rate={test_tta_disagree:.4f}  "
-    f"mean rel ||Δlogit||={test_tta_rel:.4f}"
-)
-print("\nClassification report (test, V10):")
-print(
-    classification_report(
-        tt, tp,
-        target_names=[_display_class_name(c) for c in CLASSIFIER_CLASSES],
-        zero_division=0,
-    )
-)
-print("Confusion matrix (test V10):\n", confusion_matrix(tt, tp))
-
 vers_tag = "_".join(sorted(used_versions))
 ckpt     = _REPO / "checkpoints" / f"punch_transformer_4cls_bio_{vers_tag}.pt"
 ckpt.parent.mkdir(parents=True, exist_ok=True)
@@ -738,13 +724,12 @@ torch.save(
             f"{_NO_PUNCH_SAMPLES_PER_GAP_SPAN} raw windows per span (flush-left/right)"
         ),
         "train_versions":      sorted(TRAIN_VERSIONS),
-        "test_version":        TEST_VERSION,
-        "test_acc":            float(test_acc),
         "grad_clip_max_norm":  GRAD_CLIP_MAX_NORM,
         "early_stop_patience": EARLY_STOP_PATIENCE,
         "epochs_ran":          epochs_ran,
         "augmentation": (
-            f"jitter±{JITTER_RANGE} + mirror_flip(50%, pose diversity — label unchanged)"
+            f"random_temporal_placement(clip<window) or jitter±{JITTER_RANGE}(clip≥window) "
+            f"+ mirror_flip(50%, pose diversity — label unchanged)"
         ),
         "lr_schedule": {
             "warmup_epochs": WARMUP_EPOCHS,

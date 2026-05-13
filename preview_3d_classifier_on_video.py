@@ -34,6 +34,11 @@ Biomechanics 7-class model (``train_3d_classifier_bio.py``, 15 input channels)::
 
     python preview_3d_classifier_on_video.py --ver V7 \\
         --checkpoint checkpoints/punch_transformer_7cls_bio_<versions>.pt
+
+4-class biomechanics (``train_4cls_bio.py``) on a held-out workbook, **live window** (no MP4 unless ``--out``)::
+
+    python preview_3d_classifier_on_video.py --ver V4 --live --start-frac 0 \\
+        --checkpoint checkpoints/punch_transformer_4cls_bio_V10_V5_V6_V7_V8_V9.pt
 """
 
 from __future__ import annotations
@@ -355,6 +360,12 @@ def main() -> None:
         "Example: 2 → half speed, wall-clock duration doubles.",
     )
     ap.add_argument("--out", type=Path, default=None)
+    ap.add_argument(
+        "--live",
+        action="store_true",
+        help="Show playback in an OpenCV window (press q or Esc to stop). "
+        "If --out is omitted, no MP4 is written (encode-only then display).",
+    )
     args = ap.parse_args()
 
     ver = args.ver.strip().upper()
@@ -492,24 +503,34 @@ def main() -> None:
         pred_s[t] = pr_idx[si]
         prob_s[t] = pr_pb[si]
 
-    out_path = (
-        args.out.resolve()
-        if args.out is not None
-        else (
-            _FIGURES
-            / f"{ver}_3d_punch_transformer{'_bio' if in_ch == 15 else ''}{'_7cls' if len(punch_classes) > 6 else ''}_preview.mp4"
-        ).resolve()
-    )
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if args.live and args.out is None:
+        out_path = None
+    else:
+        out_path = (
+            args.out.resolve()
+            if args.out is not None
+            else (
+                _FIGURES
+                / f"{ver}_3d_punch_transformer{'_bio' if in_ch == 15 else ''}{'_7cls' if len(punch_classes) > 6 else ''}_preview.mp4"
+            ).resolve()
+        )
 
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(out_path), fourcc, out_fps, (fw, fh))
-    if not writer.isOpened():
-        raise SystemExit(f"VideoWriter failed: {out_path}")
+    writer: cv2.VideoWriter | None = None
+    if out_path is not None:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(str(out_path), fourcc, out_fps, (fw, fh))
+        if not writer.isOpened():
+            raise SystemExit(f"VideoWriter failed: {out_path}")
+
+    if args.live:
+        delay_ms = max(1, int(round(1000.0 * sm / max(fps, 1e-6))))
+        print(f"Live display: delay_ms≈{delay_ms} (q or Esc to quit)")
 
     cap = cv2.VideoCapture(str(video_path))
     cap.set(cv2.CAP_PROP_POS_FRAMES, float(start_i))
 
+    win = "3d_punch_classifier_preview"
     try:
         for j in range(encode_n):
             ok, frame = cap.read()
@@ -527,16 +548,32 @@ def main() -> None:
                 + (f"  slow={sm:g}x" if sm > 1.0 else "")
             )
             _overlay_banner(frame, line1, line2, line3)
-            writer.write(frame)
+            if writer is not None:
+                writer.write(frame)
+            if args.live:
+                cv2.imshow(win, frame)
+                key = cv2.waitKey(delay_ms) & 0xFF
+                if key in (ord("q"), 27):
+                    print("Stopped by user (q/Esc).")
+                    break
     finally:
-        writer.release()
+        if writer is not None:
+            writer.release()
         cap.release()
+        if args.live:
+            try:
+                cv2.destroyWindow(win)
+            except Exception:
+                cv2.destroyAllWindows()
 
-    try:
-        print_rel = out_path.relative_to(_REPO)
-    except ValueError:
-        print_rel = out_path
-    print(f"\nWrote → {print_rel}")
+    if out_path is not None:
+        try:
+            print_rel = out_path.relative_to(_REPO)
+        except ValueError:
+            print_rel = out_path
+        print(f"\nWrote → {print_rel}")
+    elif args.live:
+        print("\nLive session finished (no file written; pass --out PATH.mp4 to save).")
 
 
 if __name__ == "__main__":
