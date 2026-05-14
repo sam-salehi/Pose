@@ -8,6 +8,8 @@
 #   com_z                         — mean joint z (vertical loading proxy)
 # Total in_channels = 15.
 #
+# Train / eval split: workbooks V4–V9 for optimisation; V10 held out for final test metrics.
+#
 # Mirror augmentation flips lead↔rear labels and permutes TTA logits accordingly
 # so averaging original + mirrored predictions is coherent across all 7 classes.
 
@@ -17,6 +19,10 @@ from collections import Counter
 import json
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from sklearn.metrics import (
@@ -47,8 +53,11 @@ _REPO = Path.cwd().resolve()
 _MOTIONBERT_DIR = _REPO / "Dataset" / "MotionBERT_3d"
 _ANNOTATION_DIR = _REPO / "Dataset" / "Annotation_files"
 _GAP_REVIEW_JSON = _REPO / "Dataset" / "gap_labels" / "gap_review.json"
+_FIGURES = _REPO / "figures"
 
-USE_VERSIONS: frozenset[str] = frozenset(f"V{i}" for i in range(3, 11))
+# Train on V4–V9; held-out workbook for post-train evaluation only.
+TRAIN_VERSIONS: frozenset[str] = frozenset(f"V{i}" for i in range(4, 10))
+TEST_VERSION:   str             = "V10"
 
 CLF_WINDOW = 16
 JITTER_RANGE = 2
@@ -120,6 +129,10 @@ _MIRROR_LABEL_MAP: list[int] = [
     PUNCH_CLASSES.index("lead_uppercut"), # rear_uppercut → lead_uppercut
     NO_PUNCH_IDX,                         # no_punch → no_punch
 ]
+
+# Fine 7-class index → merged 4-way space (same grouping as train_4cls_bio):
+#   0 jab_punch  (cross + jab), 1 hook, 2 uppercut, 3 no_punch
+_MERGED4_FROM_FINE = np.array([0, 0, 1, 2, 1, 2, 3], dtype=np.int64)
 
 # H36M-17 L/R joint swap for sagittal-plane reflection
 _FLIP_JOINT_ORDER = [0, 4, 5, 6, 1, 2, 3, 7, 8, 9, 10, 14, 15, 16, 11, 12, 13]
@@ -252,8 +265,8 @@ def _prepare_window_3d(seq: np.ndarray, window: int, jitter: int = 0) -> np.ndar
 # Data loading
 # =============================================================================
 
-def _no_punch_spans_from_gap_review() -> list[tuple[str, int, int]]:
-    """(workbook, start, end) half-open frame indices for each no_punch chunk (USE_VERSIONS only)."""
+def _no_punch_spans_from_gap_review(versions: frozenset[str]) -> list[tuple[str, int, int]]:
+    """(workbook, start, end) half-open frame indices for each no_punch chunk in ``versions``."""
     if not _GAP_REVIEW_JSON.is_file():
         raise SystemExit(f"Missing {_GAP_REVIEW_JSON} — run label_punch_gaps.py")
     data = json.loads(_GAP_REVIEW_JSON.read_text(encoding="utf-8"))
@@ -262,7 +275,7 @@ def _no_punch_spans_from_gap_review() -> list[tuple[str, int, int]]:
         if e.get("label") != "no_punch":
             continue
         ver = str(e["workbook"]).strip().upper()
-        if ver not in USE_VERSIONS:
+        if ver not in versions:
             continue
         s0, e0 = int(e["start"]), int(e["end"])
         if e0 > s0:
@@ -291,10 +304,12 @@ def _two_raw_spans_for_no_punch(g0: int, g1: int, window: int) -> list[tuple[int
     return [(first_start, first_start + window), (last_start, g1)]
 
 
-def load_3d_clips_with_negatives() -> tuple[list[np.ndarray], np.ndarray, list[str]]:
+def load_3d_clips_with_negatives(
+    versions: frozenset[str],
+) -> tuple[list[np.ndarray], np.ndarray, list[str]]:
     """
-    Punch clips from xlsx annotations + ``no_punch`` only from ``gap_review.json``
-    (entries with label ``no_punch``), matching ``train_3d_classifier_no_punch.py``.
+    Punch clips from xlsx annotations + ``no_punch`` from ``gap_review.json``
+    (entries with label ``no_punch``), restricted to ``versions``.
     """
     clips: list[np.ndarray] = []
     y_list: list[int] = []
@@ -305,7 +320,7 @@ def load_3d_clips_with_negatives() -> tuple[list[np.ndarray], np.ndarray, list[s
         if not ver_dir.is_dir():
             continue
         ver = ver_dir.name.upper()
-        if ver not in USE_VERSIONS:
+        if ver not in versions:
             continue
         npy_path = ver_dir / "X3D.npy"
         if not npy_path.exists():
@@ -338,10 +353,10 @@ def load_3d_clips_with_negatives() -> tuple[list[np.ndarray], np.ndarray, list[s
     if not clips:
         raise SystemExit("No 3D clips found — check Dataset/MotionBERT_3d/ structure.")
 
-    spans = _no_punch_spans_from_gap_review()
+    spans = _no_punch_spans_from_gap_review(versions)
     if not spans:
         raise SystemExit(
-            f"No no_punch entries for USE_VERSIONS in {_GAP_REVIEW_JSON} — run label_punch_gaps.py"
+            f"No no_punch entries for versions={versions} in {_GAP_REVIEW_JSON} — run label_punch_gaps.py"
         )
 
     cache: dict[str, np.ndarray] = {}
@@ -376,7 +391,7 @@ def load_3d_clips_with_negatives() -> tuple[list[np.ndarray], np.ndarray, list[s
     )
     if n_np == 0:
         raise SystemExit(
-            "Could not load any no_punch clips — check gap_review vs MotionBERT_3d and USE_VERSIONS."
+            "Could not load any no_punch clips — check gap_review vs MotionBERT_3d and requested versions."
         )
 
     print(f"\nTotal punch clips: {n_punch}  no_punch clips: {n_np}")
@@ -435,17 +450,26 @@ class Clf3DDataset(Dataset):
 # Metrics helpers
 # =============================================================================
 
-def _extended_val_summary(vt: np.ndarray, vp: np.ndarray) -> str:
-    vt  = np.asarray(vt)
-    vp  = np.asarray(vp)
+def _extended_val_summary(
+    vt: np.ndarray,
+    vp: np.ndarray,
+    *,
+    prefix: str = "val_",
+) -> str:
+    """Bal acc, head macro F1, merged 3-punch macro F1, acc on true punches (prefix labels the split)."""
+    vt  = np.asarray(vt, dtype=np.int64)
+    vp  = np.asarray(vp, dtype=np.int64)
     bal = balanced_accuracy_score(vt, vp)
     f7  = f1_score(vt, vp, average="macro", zero_division=0)
-    f6  = f1_score(vt, vp, average="macro", labels=list(range(6)), zero_division=0)
+    vt_m = _MERGED4_FROM_FINE[vt]
+    vp_m = _MERGED4_FROM_FINE[vp]
+    f3  = f1_score(vt_m, vp_m, average="macro", labels=[0, 1, 2], zero_division=0)
     pm  = vt != NO_PUNCH_IDX
     acc_on_punch = float((vp[pm] == vt[pm]).mean()) if np.any(pm) else float("nan")
+    p = prefix
     return (
-        f"val_bal_acc={bal:.3f}  val_macroF1_7cls={f7:.3f}  "
-        f"val_macroF1_6punch={f6:.3f}  val_acc_true_punch={acc_on_punch:.3f}"
+        f"{p}bal_acc={bal:.3f}  {p}macroF1_7cls={f7:.3f}  "
+        f"{p}macroF1_3punch={f3:.3f}  {p}acc_true_punch={acc_on_punch:.3f}"
     )
 
 
@@ -453,6 +477,46 @@ def _display_class_name(c: str) -> str:
     if c == "no_punch":
         return "No Punch"
     return c.replace("_", " ").title()
+
+
+def _plot_training_curves(
+    path: Path,
+    epochs: list[int],
+    train_loss: list[float],
+    val_loss: list[float],
+    train_acc: list[float],
+    val_acc: list[float],
+    best_epoch: int,
+) -> None:
+    """Save train/val loss and accuracy vs epoch (smooth polylines)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(11.5, 4.25))
+
+    ax0.plot(epochs, train_loss, color="#1f77b4", lw=2.0, label="Train loss")
+    ax0.plot(epochs, val_loss, color="#ff7f0e", lw=2.0, label="Val loss")
+    ax0.axvline(best_epoch, color="0.45", ls="--", lw=1.1, alpha=0.85, label=f"Best val acc (ep {best_epoch})")
+    ax0.set_xlabel("Epoch")
+    ax0.set_ylabel("Loss")
+    ax0.set_title("7-class bio — cross-entropy (weighted + label smoothing)")
+    ax0.legend(loc="upper right", fontsize=9)
+    ax0.grid(True, alpha=0.28)
+    ax0.set_xlim(left=1)
+
+    ax1.plot(epochs, train_acc, color="#2ca02c", lw=2.0, label="Train acc (online)")
+    ax1.plot(epochs, val_acc, color="#d62728", lw=2.0, label="Val acc (TTA mirror avg)")
+    ax1.axvline(best_epoch, color="0.45", ls="--", lw=1.1, alpha=0.85)
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Accuracy")
+    ax1.set_title("7-class bio — accuracy")
+    ax1.legend(loc="lower right", fontsize=9)
+    ax1.grid(True, alpha=0.28)
+    ax1.set_xlim(left=1)
+    ax1.set_ylim(0.0, 1.0)
+
+    fig.suptitle("train_3d_classifier_bio.py", fontsize=11, y=1.02)
+    fig.tight_layout()
+    fig.savefig(path, dpi=140, bbox_inches="tight")
+    plt.close(fig)
 
 
 # =============================================================================
@@ -487,16 +551,19 @@ if not _MOTIONBERT_DIR.is_dir():
     raise SystemExit(f"Missing: {_MOTIONBERT_DIR}")
 if not _ANNOTATION_DIR.is_dir():
     raise SystemExit(f"Missing: {_ANNOTATION_DIR}")
-if not USE_VERSIONS:
-    raise SystemExit("USE_VERSIONS is empty.")
+if not TRAIN_VERSIONS:
+    raise SystemExit("TRAIN_VERSIONS is empty.")
 
-print(f"USE_VERSIONS ({len(USE_VERSIONS)}): {', '.join(sorted(USE_VERSIONS))}")
+print(
+    f"TRAIN_VERSIONS ({len(TRAIN_VERSIONS)}): {', '.join(sorted(TRAIN_VERSIONS))}  "
+    f"|  TEST_VERSION (held-out): {TEST_VERSION}"
+)
 print(f"in_channels={IN_CHANNELS} (pos+vel+acc=9 + {N_SCALARS} broadcast scalars)")
 print(f"scipy SG smoothing: {'enabled' if _HAS_SCIPY else 'DISABLED (install scipy)'}")
 print(
     f"Loading punches (xlsx) + no_punch ({_GAP_REVIEW_JSON.relative_to(_REPO)}) …"
 )
-all_clips, all_y, used_versions = load_3d_clips_with_negatives()
+all_clips, all_y, used_versions = load_3d_clips_with_negatives(TRAIN_VERSIONS)
 print(f"\nLoaded {len(all_y)} clips  device={DEVICE}")
 print(
     "Class distribution:",
@@ -607,6 +674,12 @@ best_acc   = 0.0
 best_state = None
 patience_ctr = 0
 epochs_ran = 0
+best_epoch = 1
+hist_epochs: list[int] = []
+hist_train_loss: list[float] = []
+hist_val_loss: list[float] = []
+hist_train_acc: list[float] = []
+hist_val_acc: list[float] = []
 
 for epoch in range(1, EPOCHS + 1):
     epochs_ran = epoch
@@ -631,8 +704,17 @@ for epoch in range(1, EPOCHS + 1):
         best_acc   = va_acc
         best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
         patience_ctr = 0
+        best_epoch = epoch
     else:
         patience_ctr += 1
+
+    tr_loss = run_loss / max(run_n, 1)
+    tr_acc  = run_ok / max(run_n, 1)
+    hist_epochs.append(epoch)
+    hist_train_loss.append(tr_loss)
+    hist_val_loss.append(va_loss)
+    hist_train_acc.append(tr_acc)
+    hist_val_acc.append(va_acc)
 
     print(
         f"epoch {epoch:02d}/{EPOCHS}  lr {lr_now:.2e}  "
@@ -656,7 +738,9 @@ _, _, vp, vt, tta_disagree_final, tta_rel_final = eval_epoch(val_dl)
 print(f"\nBest val acc: {best_acc:.3f}")
 print(_extended_val_summary(vt, vp))
 print(
-    "macroF1_6punch: macro-averaged F1 over six punch labels. "
+    "macroF1_7cls: macro-averaged F1 over all seven labels. "
+    "macroF1_3punch: macro F1 over jab_punch / hook / uppercut "
+    "(six fine types merged as in train_4cls_bio). "
     "acc_true_punch: accuracy restricted to ground-truth punch samples."
 )
 print(
@@ -671,9 +755,55 @@ print(
         zero_division=0,
     )
 )
-print("Confusion matrix:\n", confusion_matrix(vt, vp))
+print("Confusion matrix (val):\n", confusion_matrix(vt, vp))
+
+print(f"\n{'='*60}\nHeld-out test ({TEST_VERSION})\n{'='*60}")
+test_clips, test_y, test_used = load_3d_clips_with_negatives(frozenset({TEST_VERSION}))
+if set(test_used) != {TEST_VERSION}:
+    raise SystemExit(
+        f"Held-out load failed: expected data for {TEST_VERSION!r}, got {test_used}. "
+        f"Need Dataset/MotionBERT_3d/{TEST_VERSION}/X3D.npy, "
+        f"Dataset/Annotation_files/{TEST_VERSION}.xlsx, "
+        f"and gap_review.json no_punch rows for that workbook."
+    )
+print(
+    f"Test clips: {len(test_y)}  class distribution:",
+    {CLASSIFIER_CLASSES[k]: v for k, v in sorted(Counter(test_y.tolist()).items())},
+)
+test_ds = Clf3DDataset(test_clips, test_y, window=CLF_WINDOW, augment=False)
+test_dl = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+test_loss, test_acc, tp, tt, test_tta_d, test_tta_r = eval_epoch(test_dl)
+print(f"test loss={test_loss:.4f}  test acc={test_acc:.4f}")
+print(_extended_val_summary(tt, tp, prefix="test_"))
+print(
+    f"Test TTA: argmax mismatch rate={test_tta_d:.4f}  mean rel ||Δlogit||={test_tta_r:.4f}"
+)
+print(f"\nClassification report (test, {TEST_VERSION}):")
+print(
+    classification_report(
+        tt, tp,
+        target_names=[_display_class_name(c) for c in CLASSIFIER_CLASSES],
+        zero_division=0,
+    )
+)
+print(f"Confusion matrix (test {TEST_VERSION}):\n", confusion_matrix(tt, tp))
 
 vers_tag = "_".join(sorted(used_versions))
+curve_path = _FIGURES / f"train_7cls_bio_curves_{vers_tag}.png"
+_plot_training_curves(
+    curve_path,
+    hist_epochs,
+    hist_train_loss,
+    hist_val_loss,
+    hist_train_acc,
+    hist_val_acc,
+    best_epoch,
+)
+try:
+    print(f"\nTraining curves → {curve_path.relative_to(_REPO)}")
+except ValueError:
+    print(f"\nTraining curves → {curve_path}")
+
 ckpt     = _REPO / "checkpoints" / f"punch_transformer_7cls_bio_{vers_tag}.pt"
 ckpt.parent.mkdir(parents=True, exist_ok=True)
 torch.save(
@@ -717,6 +847,21 @@ torch.save(
             "warmup":        "LinearLR 0.01→1.0 × base LR",
             "cosine":        f"CosineAnnealingLR T_max={cosine_epochs} eta_min={LR_MIN}",
         },
+        "best_val_epoch":     best_epoch,
+        "training_curves_png": str(curve_path.relative_to(_REPO)),
+        "training_history": {
+            "epoch":       hist_epochs,
+            "train_loss":  hist_train_loss,
+            "val_loss":    hist_val_loss,
+            "train_acc":   hist_train_acc,
+            "val_acc":     hist_val_acc,
+        },
+        "train_versions":      sorted(TRAIN_VERSIONS),
+        "test_version":        TEST_VERSION,
+        "test_loss":           float(test_loss),
+        "test_acc":            float(test_acc),
+        "test_tta_argmax_mismatch": float(test_tta_d),
+        "test_tta_rel_logit_gap":   float(test_tta_r),
     },
     ckpt,
 )
